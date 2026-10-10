@@ -1,6 +1,6 @@
 # Indeed Job Extractor
 
-**Version 0.4.4 — beta.** Pagination and sequential extraction have been tested on the Italian desktop site. The new v0.4.4 duplicate-matching correction passes simulated-DOM tests and requires a live re-test.
+**Version 0.4.5 — beta.** Pagination and sequential extraction have been tested on the Italian desktop site. The new v0.4.5 duplicate-matching correction passes simulated-DOM tests and requires a live re-test.
 
 A lightweight [Tampermonkey](https://www.tampermonkey.net/) userscript for collecting job listings and their visible full descriptions from Indeed. It runs locally in your browser and exports structured JSON, readable TXT, and a diagnostic JSON log. No API key, server, third-party analytics, or build process is required.
 
@@ -22,7 +22,7 @@ Independent, unofficial project. Not affiliated with, endorsed by, or sponsored 
 1. Install [Tampermonkey](https://www.tampermonkey.net/) in your browser.
 2. [Open the userscript](https://raw.githubusercontent.com/raffaelececere/indeed-job-extractor/main/indeed-job-extractor.user.js) and install it with Tampermonkey, or replace your existing Indeed Job Extractor script with the file from this repository.
 3. Open Indeed and navigate to its Homepage or a job search page with listings. Refresh the tab if necessary.
-4. Confirm the floating panel shows **v0.4.4**. **Do not install two copies** of the script.
+4. Confirm the floating panel shows **v0.4.5**. **Do not install two copies** of the script.
 
 Tampermonkey update metadata points to the `main` branch of this repository. Earlier saved jobs from v0.1–v0.3 use the same local storage namespace and remain available after upgrading. **Do not click CLEAR SAVED unless you intend to delete your stored jobs and debug history.**
 
@@ -56,11 +56,11 @@ If a card cannot be selected, it is *not* automatically treated as a valid job: 
 
 The userscript targets `indeed.com` and its subdomains. It was developed using the Italian desktop site in October 2026. **Other countries, accounts, layouts and mobile interfaces have not been validated.** Selectors and navigation controls may change without notice. Review exported data and follow Indeed's applicable terms and policies.
 
-## Version 0.4.4: pagination guard correction
+## Version 0.4.5: pagination guard correction
 
 A real `/jobs` debug run of v0.4.0 saved 15 listings, then ended with `pagination_search_changed` before clicking the next-page control. The guard compared *all* non-page URL parameters. Indeed may add/remove tracking or UI parameters between result pages, which incorrectly triggered the stop.
 
-v0.4.4 now rejects explicit changes in the actual search criteria while tolerating added or removed URL parameters on a verified pagination control. When a genuine search-criteria mismatch is detected, the DEBUG LOG records the changed parameter names and source/destination page keys. Checkpoint resume also accepts the exact expected next-page URL after a full reload. It still does not invent page URLs or follow unrelated domains. This correction is tested in the local simulated DOM but needs a new live Indeed validation.
+v0.4.5 now rejects explicit changes in the actual search criteria while tolerating added or removed URL parameters on a verified pagination control. When a genuine search-criteria mismatch is detected, the DEBUG LOG records the changed parameter names and source/destination page keys. Checkpoint resume also accepts the exact expected next-page URL after a full reload. It still does not invent page URLs or follow unrelated domains. This correction is tested in the local simulated DOM but needs a new live Indeed validation.
 
 ## Development
 
@@ -86,20 +86,28 @@ indeed-job-extractor/
 Raffaele Marco Cecere — [GitHub @raffaelececere](https://github.com/raffaelececere)
 
 
-### v0.4.4 — preloaded pane validation
+### v0.4.5 — preloaded pane validation
 
 Some paginated results pre-render the first job's description before the URL receives its `vjk` parameter. Earlier versions treated that *unchanged* description as stale and skipped the first result. The validator now accepts a stable title-matching description after its URL ID matches the target **only when no previously verified different job ID existed**. Stale descriptions from a known different job are still rejected.
 
 If the search genuinely has fewer eligible results than the selected target, extraction stops at the end of the available pages; the target is a maximum, not a guarantee. Unresponsive cards with unverified IDs remain excluded from exports.
 
 
-## v0.4.4 — Pagination diagnostics
+## v0.4.5 — Pagination diagnostics
 
 When the extractor exhausts the current search without detecting another page, it now records a read-only `pagination_inspection` event and includes `paginationInspection` in the DEBUG JSON export. The snapshot contains the current search query/location, the presence of a pagination container and next-page control, and brief metadata for numbered page links and controls. It helps distinguish a genuine final page from an unsupported site layout without clicking uncertain links. The extraction/navigation behavior itself is unchanged from v0.4.2.
 
 
-## v0.4.4 — Full-archive matching and unverified-card audit
+## v0.4.5 — Full-archive matching and unverified-card audit
 
-A real 35-job run identified two unopenable card IDs (for titles already present in saved jobs), but the previous matcher checked only the job currently visible in the right pane. If another job was selected, the result was wrongly reported as an unrelated extraction error. v0.4.4 now checks the entire verified saved-job collection for a **unique** title/company/location or exact-card match. Multiple matches stay ambiguous; mere title similarity never suffices.
+A real 35-job run identified two unopenable card IDs (for titles already present in saved jobs), but the previous matcher checked only the job currently visible in the right pane. If another job was selected, the result was wrongly reported as an unrelated extraction error. v0.4.5 now checks the entire verified saved-job collection for a **unique** title/company/location or exact-card match. Multiple matches stay ambiguous; mere title similarity never suffices.
 
 Successful extractions still require matching Job ID in the URL, matching title and stable detail content. Unreachable card IDs remain excluded from job exports. Their last observed reason, metadata, possible matches and status persist separately in `DEBUG LOG → unverifiedCards` for manual investigation. The check does not make Indeed provide a missing description or prove that alternative Job IDs are duplicates.
+
+## v0.4.5 — Preselected first card and partial exports
+
+On certain paginated layouts, the first listing appears in the details pane before its Job ID is placed in the URL. If clicking the preselected first card does not update `vjk`, the extractor now makes one bounded recovery attempt: it switches to a different visible card and then back. Both transitions must pass the original Job ID, title and stable-description checks. Otherwise the original listing remains unverified; descriptions are never guessed.
+
+JSON and debug exports include the backward-compatible `extractionState` object. Files downloaded during an active run contain `status: "in_progress"` and `partialSnapshot: true`. TXT exports explicitly indicate that the snapshot is partial. A full result is available after `run_finished`.
+
+This release preserves the existing storage prefix and the verified/unverified distinction. The retry is covered by simulated-DOM tests, but behavior across Indeed's different locales and client interfaces still requires real-browser verification.

@@ -500,7 +500,12 @@
     try {
       discover();
       updateUI();
-      while (!stopRequested && examined < target) {
+      while (!stopRequested && savedNew < target) {
+        if (examined >= target * 3) {
+          endReason = 'too_many_skipped';
+          log('warn', 'attempt_limit_reached', { examined, savedNew, target });
+          break;
+        }
         if (location.pathname !== initialPath) {
           endReason = 'route_changed';
           log('error', 'route_changed', { initialPath, newPath: location.pathname });
@@ -514,6 +519,12 @@
         discover();
         const next = [...known.values()].find(card => !visited.has(card.id) && !jobs.has(card.id));
         if (!next) {
+          if (/^\/jobs\/?$/.test(location.pathname) && nextPageControl()) {
+            const outcome = await moveToNextPage();
+            if (outcome === 'loaded') { discover(); continue; }
+            endReason = outcome === 'stopped' ? 'user_stop' : outcome;
+            break;
+          }
           if (idleScrolls >= CONFIG.maxIdleScrolls) {
             endReason = 'no_more_jobs';
             break;
@@ -539,7 +550,7 @@
           log('warn', 'card_disappeared', { id: next.id, title: next.title });
           updateUI();
         } else {
-          status = `Reading ${examined}/${target}: ${next.title}`;
+          status = `Saved ${savedNew}/${target} · Reading ${next.title}`;
           updateUI();
           const prior = paneSnapshot();
           const priorId = currentId();
@@ -572,6 +583,7 @@
                 validation: { urlJobIdMatches: true, titleMatches: true, stableForMs: CONFIG.paneStableMs }
               });
               saveJobs();
+              savedNew++;
               previous = { ...snap, id: next.id };
               consecutiveErrors = 0;
               log('info', 'job_saved', { id: next.id, title: next.title, descriptionLength: snap.descriptionLength });
@@ -582,9 +594,22 @@
               log('error', 'route_changed', { id: next.id, from: initialPath, to: location.pathname });
               break;
             } else {
-              errors++;
-              consecutiveErrors++;
-              log('warn', 'job_skipped', { id: next.id, title: next.title, reason: result.reason, currentVjk: currentId() });
+              const aliasOf = matchingSavedDuplicate(next, currentId());
+              if (aliasOf) {
+                aliases++;
+                consecutiveErrors = 0;
+                log('warn', 'duplicate_alias_skipped', {
+                  id: next.id, aliasOf, title: next.title,
+                  reason: result.reason
+                });
+              } else {
+                errors++;
+                consecutiveErrors++;
+                log('warn', 'job_skipped', {
+                  id: next.id, title: next.title, reason: result.reason,
+                  currentVjk: currentId(), href: anchor.href || null
+                });
+              }
             }
           } catch (error) {
             errors++;
@@ -593,6 +618,7 @@
           }
           updateUI();
         }
+        saveCheckpoint(false);
         if (consecutiveErrors >= CONFIG.maxConsecutiveErrors) {
           endReason = 'consecutive_errors';
           log('error', 'error_threshold_reached', { examined, errors });
@@ -601,19 +627,19 @@
         if (!stopRequested) await sleep(240);
       }
       if (stopRequested) endReason = 'user_stop';
-      else if (examined >= target) endReason = 'job_limit_reached';
+      else if (savedNew >= target) endReason = 'job_limit_reached';
     } finally {
       running = false;
       stopRequested = false;
       lastRun = {
         finishedAt: new Date().toISOString(),
-        target, examined, discovered, skippedExisting,
-        errors, idleScrolls, savedTotal: jobs.size, reason: endReason
+        target, examined, savedNew, discovered, skippedExisting,
+        errors, aliases, idleScrolls, pagesProcessed, savedTotal: jobs.size, reason: endReason
       };
       status = endReason === 'job_limit_reached'
-        ? `Limit reached: ${examined} examined, ${jobs.size} saved total.`
+        ? `Target reached: ${savedNew} new jobs saved (${examined} examined).`
         : endReason === 'no_more_jobs'
-          ? `No more jobs detected: ${examined} examined.`
+          ? `No more jobs detected: ${savedNew} new jobs saved.`
           : endReason === 'user_stop'
             ? 'Stopped manually. Partial results saved.'
             : `Stopped (${endReason}). Export DEBUG LOG.`;
@@ -680,7 +706,8 @@
     if (!confirm(`Delete ${jobs.size} locally saved listings and debug history?`)) return;
     jobs.clear(); logs = [];
     saveJobs(); write('logs', []);
-    examined = discovered = skippedExisting = errors = idleScrolls = 0;
+    examined = discovered = skippedExisting = errors = idleScrolls = aliases = savedNew = 0;
+    pagesProcessed = 1;
     lastRun = null;
     write('lastRun', null);
     write('activeRun', null);

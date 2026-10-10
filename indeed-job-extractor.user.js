@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Indeed Job Extractor
 // @namespace    https://github.com/raffaelececere
-// @version      0.3.0
+// @version      0.4.0
 // @description  Collect Indeed job listings with bounded infinite-scroll discovery, verified descriptions, local storage and JSON/TXT exports.
 // @author       Raffaele Marco Cecere
 // @homepageURL  https://github.com/raffaelececere/indeed-job-extractor
@@ -21,7 +21,7 @@
 
   if (window.top !== window.self || document.getElementById('ije-root')) return;
 
-  const VERSION = '0.3.0';
+  const VERSION = '0.4.0';
   // Preserve v0.1 saved results and diagnostics after an upgrade.
   const PREFIX = 'IJE_V01_';
   const LIMITS = [10, 25, 50, 100, 250, 500];
@@ -33,6 +33,9 @@
     paneStableMs: 450,
     scrollPauseMs: 1400,
     maxIdleScrolls: 5,
+    maxPages: 60,
+    pageTransitionMs: 7500,
+    pagePollMs: 150,
     maxConsecutiveErrors: 3,
     maxRunMs: 45 * 60 * 1000
   });
@@ -80,13 +83,17 @@
   let minimized = false;
   let status = 'Ready';
   let examined = 0;
+  let savedNew = 0;
   let discovered = 0;
   let skippedExisting = 0;
   let errors = 0;
+  let aliases = 0;
+  let pagesProcessed = 1;
   let target = 25;
   let idleScrolls = 0;
   let lastRun = read('lastRun', null);
   const interruptedRun = read('activeRun', null);
+  let resumeAfterNavigation = false;
 
   function log(level, event, fields = {}) {
     const entry = { at: new Date().toISOString(), level, event, ...fields };
@@ -233,6 +240,85 @@
     return 'nested_container';
   }
 
+
+  // Search-result pages use pagination; homepage feeds may use infinite scroll.
+  // Use Indeed's real UI controls, never fabricated pagination links.
+  function searchKey(raw = location.href) {
+    try {
+      const u = new URL(raw, location.href);
+      for (const name of ['start', 'page', 'p', 'vjk', 'jk', 'from']) u.searchParams.delete(name);
+      const values = [...u.searchParams.entries()].sort(([a, av], [b, bv]) => a.localeCompare(b) || av.localeCompare(bv));
+      return `${u.origin}${u.pathname}?${new URLSearchParams(values)}`;
+    } catch { return location.pathname; }
+  }
+  function pageKey(raw = location.href) {
+    try {
+      const u = new URL(raw, location.href);
+      u.searchParams.delete('vjk'); u.searchParams.delete('jk');
+      return `${u.origin}${u.pathname}?${[...u.searchParams.entries()].sort().map(x => x.join('=')).join('&')}`;
+    } catch { return String(raw); }
+  }
+  function eligiblePageElement(el) {
+    if (!el || el.disabled || el.getAttribute('aria-disabled') === 'true') return false;
+    if (el.closest('#ije-root')) return false;
+    if (el.tagName === 'A' && el.href) {
+      try {
+        const dest = new URL(el.href, location.href);
+        if (dest.origin !== location.origin || !/^\/jobs\/?$/.test(dest.pathname)) return false;
+      } catch { return false; }
+    }
+    return true;
+  }
+  function paginationRoot() {
+    const candidates = [...document.querySelectorAll(
+      'nav[aria-label*="pagin" i], nav[aria-label*="page" i], [data-testid*="pagination" i], [class*="pagination" i]'
+    )].filter(el => !el.closest('#ije-root'));
+    const direct = candidates.find(el => el.querySelector('a,button,[role="button"]'));
+    if (direct) return direct;
+    return [...document.querySelectorAll('nav')].find(nav =>
+      [...nav.querySelectorAll('a,button,[role="button"]')]
+        .filter(el => /^\d+$/.test(clean(el.innerText || el.textContent))).length >= 2
+    ) || null;
+  }
+  function nextPageControl() {
+    if (!/^\/jobs\/?$/.test(location.pathname)) return null;
+    const explicit = document.querySelector('a[data-testid="pagination-page-next"], button[data-testid="pagination-page-next"]');
+    if (explicit && eligiblePageElement(explicit)) return explicit;
+    const root = paginationRoot();
+    if (!root) return null;
+    const controls = [...root.querySelectorAll('a,button,[role="button"]')].filter(eligiblePageElement);
+    const next = controls.find(el => {
+      const label = [el.getAttribute('aria-label'), el.getAttribute('data-testid'), el.title, el.getAttribute('rel')].filter(Boolean).join(' ');
+      return /(^|[\s_-])(next|successiv|seguent|weiter|suivant|siguiente|pr[oó]xim)([\s_-]|$)/i.test(label)
+        || el.getAttribute('rel') === 'next';
+    });
+    if (next) return next;
+    const trailingArrow = controls.at(-1);
+    if (trailingArrow && /^(›|»|→|❯|>)$/.test(clean(trailingArrow.innerText || trailingArrow.textContent))) return trailingArrow;
+    const current = controls.find(el => el.getAttribute('aria-current') === 'page'
+      || el.getAttribute('data-testid') === 'pagination-page-current')
+      || controls.find(el => el.getAttribute('aria-selected') === 'true');
+    const pageNumber = current ? Number(clean(current.innerText || current.textContent)) : NaN;
+    if (Number.isInteger(pageNumber)) {
+      return controls.find(el => clean(el.innerText || el.textContent) === String(pageNumber + 1)) || null;
+    }
+    return null;
+  }
+  function canonicalCardFingerprint(card) {
+    return [card.title, card.company, card.location, card.cardText]
+      .map(value => clean(value).toLocaleLowerCase()).join('\n');
+  }
+  function matchingSavedDuplicate(card, currentPaneId) {
+    const original = jobs.get(currentPaneId);
+    if (!original || currentPaneId === card.id) return null;
+    const sameTitle = clean(original.title).toLocaleLowerCase() === clean(card.title).toLocaleLowerCase();
+    const sameCompany = !!clean(original.company) && clean(original.company).toLocaleLowerCase() === clean(card.company).toLocaleLowerCase();
+    const sameLocation = !!clean(original.location) && clean(original.location).toLocaleLowerCase() === clean(card.location).toLocaleLowerCase();
+    const sameCard = canonicalCardFingerprint(original) === canonicalCardFingerprint(card);
+    // Even if an unresponsive card looks duplicated, never save it under an unverified ID.
+    return sameTitle && (sameCard || (sameCompany && sameLocation)) ? original.id : null;
+  }
+
   const root = document.createElement('div');
   root.id = 'ije-root';
   root.style.cssText = 'position:fixed;z-index:2147483647;top:88px;right:20px;';
@@ -264,19 +350,21 @@
       <div class="head" id="drag"><span class="brand">Indeed Job Extractor <span class="version">v${VERSION}</span></span><button class="small" id="minimize" title="Minimize panel" aria-label="Minimize">−</button></div>
       <div class="body">
         <div class="status" id="status">Ready</div>
-        <label class="choice" for="limit">New jobs to examine <select id="limit">${LIMITS.map(n => `<option value="${n}">${n} jobs</option>`).join('')}</select></label>
+        <label class="choice" for="limit">New jobs to save <select id="limit">${LIMITS.map(n => `<option value="${n}">${n} jobs</option>`).join('')}</select></label>
         <div class="progress"><div class="fill" id="fill"></div></div>
         <div class="stats">
-          <span>Visible cards: <strong id="cards">0</strong></span><span>Examined: <strong id="progress">0/25</strong></span>
-          <span>Discovered: <strong id="discovered">0</strong></span><span>Saved total: <strong id="saved">0</strong></span>
+          <span>Visible cards: <strong id="cards">0</strong></span><span>Saved this run: <strong id="progress">0/25</strong></span>
+          <span>Examined: <strong id="examined">0</strong></span><span>Discovered: <strong id="discovered">0</strong></span>
+          <span>Saved total: <strong id="saved">0</strong></span>
           <span>Existing skipped: <strong id="skipped">0</strong></span><span>Errors: <strong id="errors">0</strong></span>
+          <span>Duplicate aliases: <strong id="aliases">0</strong></span><span>Pages: <strong id="pages">1</strong></span>
         </div>
         <div class="buttons">
           <button class="primary" id="start">START EXTRACTION</button><button id="stop" disabled>STOP</button>
           <button id="json">EXPORT JSON</button><button id="txt">EXPORT TXT</button>
           <button id="debug">DEBUG LOG</button><button class="danger" id="clear">CLEAR SAVED</button>
         </div>
-        <div class="hint">Bounded scroll discovery · Sequential extraction · Automatic stop at job limit or after ${CONFIG.maxIdleScrolls} scroll attempts without new listings. Existing jobs remain saved locally.</div>
+        <div class="hint">Numbered search pages + bounded homepage scrolling · Sequential extraction · Per-run target counts new jobs successfully saved. Saved jobs remain available locally.</div>
       </div>
     </section>
     <button class="mini" id="reopen" hidden>Indeed Extractor</button>`;
@@ -288,12 +376,15 @@
   function updateUI() {
     ui('status').textContent = status;
     ui('cards').textContent = String(cardsNow().size);
-    ui('progress').textContent = `${examined}/${target}`;
+    ui('progress').textContent = `${savedNew}/${target}`;
+    ui('examined').textContent = String(examined);
     ui('discovered').textContent = String(discovered);
     ui('saved').textContent = String(jobs.size);
     ui('skipped').textContent = String(skippedExisting);
     ui('errors').textContent = String(errors);
-    ui('fill').style.width = `${Math.min(100, (examined / target) * 100)}%`;
+    ui('aliases').textContent = String(aliases);
+    ui('pages').textContent = String(pagesProcessed);
+    ui('fill').style.width = `${Math.min(100, (savedNew / target) * 100)}%`;
     ui('start').disabled = running;
     ui('stop').disabled = !running;
     ui('limit').disabled = running;

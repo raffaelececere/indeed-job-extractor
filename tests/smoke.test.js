@@ -10,7 +10,7 @@ const test = require('node:test');
 
 const source = fs.readFileSync(path.join(__dirname, '..', 'indeed-job-extractor.user.js'), 'utf8');
 
-function harness({ initial = 2, limit = 10, batches = [2, 2], preSaved = [], activateViaWrapper = false, pages = null, aliasAt = -1, startPage = 0, initialStorage = null, paginationClickNoOp = false } = {}) {
+function harness({ initial = 2, limit = 10, batches = [2, 2], preSaved = [], activateViaWrapper = false, pages = null, aliasAt = -1, startPage = 0, initialStorage = null, paginationClickNoOp = false, paginationHrefMode = 'normal' } = {}) {
   const storage = new Map(initialStorage || []);
   if (preSaved.length) storage.set('IJE_V01_jobs', JSON.stringify(preSaved));
   storage.set('IJE_V01_limit', JSON.stringify(limit));
@@ -107,7 +107,13 @@ function harness({ initial = 2, limit = 10, batches = [2, 2], preSaved = [], act
     };
     const next = {
       tagName: 'A', disabled: activePage >= pages.length - 1,
-      href: 'https://it.indeed.com/jobs?q=software&l=Roma&start=' + ((activePage + 1) * 10),
+      href: paginationHrefMode === 'tracking'
+        ? 'https://it.indeed.com/jobs?q=software&l=Roma&start=' + ((activePage + 1) * 10) + '&filter=0&sc=0kf%3A&trackingId=abcd'
+        : paginationHrefMode === 'different_search'
+          ? 'https://it.indeed.com/jobs?q=unrelated&l=Roma&start=' + ((activePage + 1) * 10)
+          : paginationHrefMode === 'omitted_core'
+            ? 'https://it.indeed.com/jobs?start=' + ((activePage + 1) * 10) + '&sort=date'
+            : 'https://it.indeed.com/jobs?q=software&l=Roma&start=' + ((activePage + 1) * 10),
       getAttribute: key => key === 'aria-label' ? 'Next page'
         : key === 'aria-disabled' && activePage >= pages.length - 1 ? 'true' : null,
       innerText: '›', textContent: '›',
@@ -309,7 +315,7 @@ test('resumes from a full-page transition with previously captured results', asy
     company: 'Example Corp', location: 'Rome'
   }));
   const previousRun = {
-    startedAtMs: Date.now(), searchKey: 'https://it.indeed.com/jobs?l=Roma&q=software',
+    startedAtMs: Date.now(), searchKey: 'https://it.indeed.com/jobs?q=software&l=roma',
     target: 10, examined: 4, savedNew: 4, skippedExisting: 0, errors: 0, aliases: 0,
     pagesProcessed: 1,
     seen: originalJobs.map(job => job.id),
@@ -341,4 +347,34 @@ test('stops when a pagination control fails to change results', async () => {
   assert.equal(jobs.length, 2);
   assert.equal(paginationClicks, 0);
   assert.equal(logs.find(e => e.event === 'run_finished')?.reason, 'no_transition');
+});
+
+test('pagination accepts tracking and UI parameters added by Indeed', async () => {
+  const h = harness({ pages: [6, 6], limit: 10, paginationHrefMode: 'tracking' });
+  h.button('start').click();
+  await h.finished();
+  const { jobs, logs, paginationClicks } = h.stats();
+  assert.equal(jobs.length, 10);
+  assert.equal(paginationClicks, 1);
+  assert.equal(logs.find(entry => entry.event === 'run_finished')?.reason, 'job_limit_reached');
+  assert.ok(!logs.some(entry => entry.event === 'pagination_search_mismatch'));
+});
+
+test('pagination accepts next-page links without query/location parameters', async () => {
+  const h = harness({ pages: [6, 6], limit: 10, paginationHrefMode: 'omitted_core' });
+  h.button('start').click();
+  await h.finished();
+  assert.equal(h.stats().jobs.length, 10);
+  assert.equal(h.stats().paginationClicks, 1);
+});
+
+test('pagination rejects a link explicitly changing search keywords', async () => {
+  const h = harness({ pages: [2, 2], limit: 10, paginationHrefMode: 'different_search' });
+  h.button('start').click();
+  await h.finished();
+  const { jobs, logs, paginationClicks } = h.stats();
+  assert.equal(jobs.length, 2);
+  assert.equal(paginationClicks, 0);
+  assert.equal(logs.find(entry => entry.event === 'run_finished')?.reason, 'pagination_search_changed');
+  assert.ok(logs.find(entry => entry.event === 'pagination_search_mismatch')?.changedFields.includes('q'));
 });

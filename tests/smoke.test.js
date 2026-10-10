@@ -392,3 +392,30 @@ test('preloaded first-job pane with no initial vjk is captured after validated s
   assert.ok(!logs.some(entry => entry.event === 'job_skipped' && entry.id === 'abcd00000001'));
   assert.equal(logs.find(entry => entry.event === 'run_finished')?.reason, 'job_limit_reached');
 });
+
+
+test('reports navigation evidence when a search ends with no next-page control', async () => {
+  const h = harness({ pages: [3], limit: 25 });
+  h.button('start').click();
+  await h.finished();
+  const { jobs, logs, paginationClicks } = h.stats();
+  const diagnostic = logs.find(entry => entry.event === 'pagination_inspection');
+  assert.equal(jobs.length, 3);
+  assert.equal(paginationClicks, 0);
+  assert.equal(logs.find(entry => entry.event === 'run_finished')?.reason, 'no_more_jobs');
+  assert.ok(diagnostic, 'terminal pagination inspection should be logged');
+  assert.equal(diagnostic.sourcePath, '/jobs');
+  assert.equal(diagnostic.nextPageControlFound, false);
+  assert.equal(diagnostic.searchFields.q, 'software');
+});
+
+test('homepage infinite scroll also exports a safe terminal navigation diagnosis', async () => {
+  const h = harness({ initial: 2, limit: 25, batches: [] });
+  h.button('start').click();
+  await h.finished();
+  const diagnostic = h.stats().logs.find(entry => entry.event === 'pagination_inspection');
+  assert.ok(diagnostic);
+  assert.equal(diagnostic.sourcePath, '/');
+  assert.equal(diagnostic.paginationRootFound, false);
+  assert.equal(diagnostic.candidatePageLinks.length, 0);
+});

@@ -393,39 +393,108 @@
     shadow.querySelector('.panel').hidden = minimized;
   }
 
-  async function extract() {
+  async function extract(resume = false) {
     if (running) return;
     if (!cardsNow().size) {
       status = 'No job cards found. Open an Indeed results list.';
       updateUI();
       return;
     }
+    const restored = resume ? read('activeRun', null) : null;
+    if (resume && (!restored?.navigationPending || restored.searchKey !== searchKey()
+      || restored.fromPageKey === pageKey())) return;
     running = true;
     stopRequested = false;
-    examined = discovered = skippedExisting = errors = idleScrolls = 0;
-    target = Number(ui('limit').value);
+    examined = restored?.examined || 0;
+    savedNew = restored?.savedNew || 0;
+    skippedExisting = restored?.skippedExisting || 0;
+    errors = restored?.errors || 0;
+    aliases = restored?.aliases || 0;
+    pagesProcessed = restored?.pagesProcessed || 1;
+    idleScrolls = 0;
+    target = restored?.target || Number(ui('limit').value);
+    ui('limit').value = String(target);
     write('limit', target);
-    const started = Date.now();
+    const started = restored?.startedAtMs || Date.now();
     const known = new Map();
-    const visited = new Set();
+    const seen = new Set(restored?.seen || []);
+    const visited = new Set(restored?.visited || []);
+    const seenPages = new Set(restored?.seenPages || []);
+    seenPages.add(pageKey());
+    if (restored) pagesProcessed++;
     let previous = null;
     let consecutiveErrors = 0;
     let endReason = 'completed';
     const initialPath = location.pathname;
-    write('activeRun', { startedAt: new Date().toISOString(), path: initialPath, target });
-    log('info', 'run_started', { path: initialPath, target, alreadySaved: jobs.size });
+    function saveCheckpoint(navigationPending = false) {
+      write('activeRun', {
+        startedAtMs: started, searchKey: searchKey(), target, examined, savedNew,
+        skippedExisting, errors, aliases, pagesProcessed,
+        seen: [...seen], visited: [...visited], seenPages: [...seenPages],
+        navigationPending, fromPageKey: pageKey()
+      });
+    }
+    saveCheckpoint();
+    log('info', restored ? 'run_resumed' : 'run_started', {
+      path: initialPath, target, alreadySaved: jobs.size, pagesProcessed
+    });
 
     function discover() {
       let added = 0;
       for (const [id, card] of cardsNow()) {
-        if (!known.has(id)) {
+        if (!seen.has(id)) {
           added++;
+          seen.add(id);
           if (jobs.has(id)) skippedExisting++;
         }
         known.set(id, card);
       }
-      discovered = known.size;
+      discovered = seen.size;
       return added;
+    }
+
+
+    async function moveToNextPage() {
+      if (pagesProcessed >= CONFIG.maxPages) return 'max_pages';
+      const control = nextPageControl();
+      if (!control) return 'no_next_page';
+      const targetHref = control.href || null;
+      if (targetHref && seenPages.has(pageKey(targetHref))) return 'pagination_loop';
+      if (targetHref && searchKey(targetHref) !== searchKey()) return 'pagination_search_changed';
+      const beforeIds = new Set(cardsNow().keys());
+      const fromKey = pageKey();
+      saveCheckpoint(true);
+      log('info', 'pagination_next', {
+        page: pagesProcessed, from: fromKey,
+        destination: targetHref ? pageKey(targetHref) : 'UI control'
+      });
+      status = `Opening next results page (${pagesProcessed + 1})…`;
+      updateUI();
+      control.click();
+      const deadline = Date.now() + CONFIG.pageTransitionMs;
+      while (!stopRequested && Date.now() < deadline) {
+        if (location.pathname !== initialPath) return 'route_changed';
+        const nowIds = [...cardsNow().keys()];
+        const different = nowIds.some(id => !beforeIds.has(id));
+        if (different) {
+          pagesProcessed++;
+          seenPages.add(pageKey());
+          known.clear();
+          idleScrolls = 0;
+          saveCheckpoint(false);
+          log('info', 'pagination_loaded', {
+            page: pagesProcessed, newPageJobIds: nowIds.filter(id => !beforeIds.has(id)).length
+          });
+          return 'loaded';
+        }
+        await sleep(CONFIG.pagePollMs);
+      }
+      if (stopRequested) return 'stopped';
+      if (targetHref && pageKey(targetHref) !== fromKey && pageKey() === fromKey) {
+        log('warn', 'pagination_no_transition', { page: pagesProcessed });
+      }
+      saveCheckpoint(false);
+      return 'no_transition';
     }
 
     try {

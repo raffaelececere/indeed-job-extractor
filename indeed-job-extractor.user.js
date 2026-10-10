@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Indeed Job Extractor
 // @namespace    https://github.com/raffaelececere
-// @version      0.4.1
+// @version      0.4.2
 // @description  Collect Indeed job listings with bounded infinite-scroll discovery, verified descriptions, local storage and JSON/TXT exports.
 // @author       Raffaele Marco Cecere
 // @homepageURL  https://github.com/raffaelececere/indeed-job-extractor
@@ -21,7 +21,7 @@
 
   if (window.top !== window.self || document.getElementById('ije-root')) return;
 
-  const VERSION = '0.4.1';
+  const VERSION = '0.4.2';
   // Preserve v0.1 saved results and diagnostics after an upgrade.
   const PREFIX = 'IJE_V01_';
   const LIMITS = [10, 25, 50, 100, 250, 500];
@@ -163,7 +163,11 @@
       if (jobId !== card.id) reason = `URL ID mismatch (${jobId || 'none'})`;
       else if (!snap || snap.descriptionLength < 60) reason = 'description missing or too short';
       else if (!titleMatches(snap.detail, card.title)) reason = 'pane title differs from card';
-      else if (previous && previous.id !== card.id && previous.detail === snap.detail) reason = 'pane content unchanged';
+      // A new results page can pre-render its first description before vjk
+      // is set. When the pre-click pane had NO verified ID, unchanged text
+      // can be valid after URL ID, title and stable description are checked.
+      // Never permit stale content when the previous pane had a distinct ID.
+      else if (previous?.id && previous.id !== card.id && previous.detail === snap.detail) reason = 'pane content unchanged';
       else {
         const nextSignature = `${jobId}\n${snap.detail}\n${snap.description}`;
         if (signature !== nextSignature) {

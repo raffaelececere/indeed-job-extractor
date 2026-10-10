@@ -266,3 +266,79 @@ test('uses non-link wrapper when safe anchor action does not switch the pane', a
   assert.equal(logs.filter(entry => entry.event === 'safe_anchor_did_not_update_pane').length, 10);
   assert.equal(logs.find(entry => entry.event === 'run_finished')?.reason, 'job_limit_reached');
 });
+
+
+test('navigates numbered result pages rather than stopping on the first', async () => {
+  const h = harness({ pages: [4, 4, 4], limit: 10 });
+  h.button('start').click();
+  await h.finished();
+  const { jobs, logs, paginationClicks } = h.stats();
+  assert.equal(jobs.length, 10);
+  assert.equal(paginationClicks, 2);
+  assert.equal(logs.filter(e => e.event === 'pagination_loaded').length, 2);
+  assert.equal(logs.find(e => e.event === 'run_finished')?.pagesProcessed, 3);
+});
+
+test('stops safely at the last page if the target exceeds available jobs', async () => {
+  const h = harness({ pages: [2, 2], limit: 25 });
+  h.button('start').click();
+  await h.finished();
+  const { jobs, logs, paginationClicks } = h.stats();
+  assert.equal(jobs.length, 4);
+  assert.equal(paginationClicks, 1);
+  assert.equal(logs.find(e => e.event === 'run_finished')?.reason, 'no_more_jobs');
+});
+
+test('classifies unreachable duplicate alias without storing stale detail text', async () => {
+  const h = harness({ initial: 4, batches: [], limit: 10, aliasAt: 1 });
+  h.button('start').click();
+  await h.finished();
+  const { jobs, logs } = h.stats();
+  assert.equal(jobs.length, 3);
+  assert.equal(logs.filter(e => e.event === 'duplicate_alias_skipped').length, 1);
+  assert.equal(logs.find(e => e.event === 'run_finished')?.aliases, 1);
+  assert.equal(logs.find(e => e.event === 'run_finished')?.errors, 0);
+  assert.equal(jobs.some(job => job.id === 'abcdef0123456789'), false);
+});
+
+test('resumes from a full-page transition with previously captured results', async () => {
+  const originalJobs = Array.from({ length: 4 }, (_, i) => ({
+    id: 'abcd' + String(i + 1).padStart(8, '0'),
+    title: 'Job Title ' + (i + 1), description: 'already saved',
+    cardText: 'Job Title ' + (i + 1) + ' Example Corp Rome',
+    company: 'Example Corp', location: 'Rome'
+  }));
+  const previousRun = {
+    startedAtMs: Date.now(), searchKey: 'https://it.indeed.com/jobs?l=Roma&q=software',
+    target: 10, examined: 4, savedNew: 4, skippedExisting: 0, errors: 0, aliases: 0,
+    pagesProcessed: 1,
+    seen: originalJobs.map(job => job.id),
+    visited: originalJobs.map(job => job.id),
+    seenPages: ['https://it.indeed.com/jobs?l=Roma&q=software&start=0'],
+    navigationPending: true,
+    fromPageKey: 'https://it.indeed.com/jobs?l=Roma&q=software&start=0'
+  };
+  const h = harness({
+    pages: [4, 4, 4], limit: 10, startPage: 1,
+    initialStorage: [
+      ['IJE_V01_jobs', JSON.stringify(originalJobs)],
+      ['IJE_V01_activeRun', JSON.stringify(previousRun)]
+    ]
+  });
+  await h.finished();
+  const { jobs, logs, paginationClicks } = h.stats();
+  assert.equal(jobs.length, 10);
+  assert.equal(paginationClicks, 1);
+  assert.equal(logs.find(e => e.event === 'run_resumed')?.pagesProcessed, 2);
+  assert.equal(logs.find(e => e.event === 'run_finished')?.examined, 10);
+});
+
+test('stops when a pagination control fails to change results', async () => {
+  const h = harness({ pages: [2, 2], limit: 10, paginationClickNoOp: true });
+  h.button('start').click();
+  await h.finished();
+  const { jobs, logs, paginationClicks } = h.stats();
+  assert.equal(jobs.length, 2);
+  assert.equal(paginationClicks, 0);
+  assert.equal(logs.find(e => e.event === 'run_finished')?.reason, 'no_transition');
+});

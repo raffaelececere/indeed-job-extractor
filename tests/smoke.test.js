@@ -10,7 +10,7 @@ const test = require('node:test');
 
 const source = fs.readFileSync(path.join(__dirname, '..', 'indeed-job-extractor.user.js'), 'utf8');
 
-function harness({ initial = 2, limit = 10, batches = [2, 2], preSaved = [], activateViaWrapper = false, pages = null, aliasAt = -1, startPage = 0, initialStorage = null, paginationClickNoOp = false, paginationHrefMode = 'normal', preloadedFirstPane = false, aliasOfAt = null, alsoMatchAt = -1, differentCompanyAt = -1 } = {}) {
+function harness({ initial = 2, limit = 10, batches = [2, 2], preSaved = [], activateViaWrapper = false, pages = null, aliasAt = -1, startPage = 0, initialStorage = null, paginationClickNoOp = false, paginationHrefMode = 'normal', preloadedFirstPane = false, aliasOfAt = null, alsoMatchAt = -1, differentCompanyAt = -1, ignorePreselectedClick = false } = {}) {
   const storage = new Map(initialStorage || []);
   if (preSaved.length) storage.set('IJE_V01_jobs', JSON.stringify(preSaved));
   storage.set('IJE_V01_limit', JSON.stringify(limit));
@@ -35,9 +35,11 @@ function harness({ initial = 2, limit = 10, batches = [2, 2], preSaved = [], act
   let batchIndex = 0;
   let selected = preloadedFirstPane ? all[pages ? pages.slice(0, startPage).reduce((a, b) => a + b, 0) : 0] : null;
   let urlSelected = null;
+  let ignoreCurrentPreselection = ignorePreselectedClick;
   let scrollCalls = 0;
   let nativeNavigations = 0;
   let wrapperActivations = 0;
+  const downloads = [];
   const controls = new Map();
   const button = id => {
     if (!controls.has(id)) {
@@ -61,7 +63,12 @@ function harness({ initial = 2, limit = 10, batches = [2, 2], preSaved = [], act
   const anchors = all.map((job, i) => {
     const card = {
       tagName: 'DIV',
-      click: () => { if (i !== aliasAt) { selected = job; urlSelected = job; } wrapperActivations++; },
+      click: () => {
+        if (i !== aliasAt && !(ignoreCurrentPreselection && selected === job && !urlSelected)) {
+          selected = job; urlSelected = job; ignoreCurrentPreselection = false;
+        }
+        wrapperActivations++;
+      },
       innerText: `${job.title} ${job.company} Rome`,
       querySelector: selector => selector.includes('company') || selector.includes('companyName')
         ? { innerText: job.company }
@@ -84,7 +91,9 @@ function harness({ initial = 2, limit = 10, batches = [2, 2], preSaved = [], act
         };
         for (const handler of clickHandlers) handler(event);
         if (!event.defaultPrevented) nativeNavigations++;
-        if (!activateViaWrapper && i !== aliasAt) { selected = job; urlSelected = job; }
+        if (!activateViaWrapper && i !== aliasAt && !(ignoreCurrentPreselection && selected === job && !urlSelected)) {
+          selected = job; urlSelected = job; ignoreCurrentPreselection = false;
+        }
       },
       href: `https://it.indeed.com/viewjob?jk=${job.id}`,
       index: i
@@ -177,7 +186,13 @@ function harness({ initial = 2, limit = 10, batches = [2, 2], preSaved = [], act
   const context = {
     window, document, location, Date: TestDate,
     innerWidth: 1400, innerHeight: 900,
-    Event: class Event {}, URL, URLSearchParams, Blob,
+    Event: class Event {},
+    URL: class HarnessURL extends URL {
+      static createObjectURL(blob) { downloads.push(blob.data); return 'blob:local-test'; }
+      static revokeObjectURL() {}
+    },
+    URLSearchParams,
+    Blob: class HarnessBlob { constructor(parts) { this.data = parts.join(''); } },
     GM_getValue: (key, fallback) => storage.get(key) ?? fallback,
     GM_setValue: (key, value) => storage.set(key, value),
     getComputedStyle: () => ({ overflowY: 'visible' }),
@@ -196,7 +211,7 @@ function harness({ initial = 2, limit = 10, batches = [2, 2], preSaved = [], act
     throw new Error('Extraction did not finish within test timeout');
   };
   return {
-    button, storage, finished,
+    button, storage, finished, downloads,
     stats: () => ({
       jobs: JSON.parse(storage.get('IJE_V01_jobs') || '[]'),
       logs: JSON.parse(storage.get('IJE_V01_logs') || '[]'),
@@ -484,4 +499,46 @@ test('successful later extraction clears a previous unverified record', async ()
   await h.finished();
   assert.ok(h.stats().jobs.some(job => job.id === 'abcd00000001'));
   assert.deepEqual(JSON.parse(h.storage.get('IJE_V01_unverified')), []);
+});
+
+
+test('recovers a preselected first job without vjk by switching cards and back', async () => {
+  const h = harness({ pages: [3], limit: 10, preloadedFirstPane: true,
+    ignorePreselectedClick: true });
+  h.button('start').click();
+  await h.finished();
+  const { jobs, logs, nativeNavigations } = h.stats();
+  assert.equal(jobs.length, 3);
+  assert.ok(jobs.some(j => j.id === 'abcd00000001'));
+  assert.ok(logs.some(x => x.event === 'first_card_recovered' && x.id === 'abcd00000001'));
+  assert.equal(logs.find(x => x.event === 'run_finished')?.errors, 0);
+  assert.equal(nativeNavigations, 0);
+});
+
+test('cannot accidentally verify an unreachable first job through alternate selection', async () => {
+  const h = harness({ pages: [3], limit: 10, aliasAt: 0, preloadedFirstPane: true });
+  h.button('start').click();
+  await h.finished();
+  const { jobs, logs } = h.stats();
+  assert.equal(jobs.length, 2);
+  assert.ok(!jobs.some(j => j.id === 'abcd00000001'));
+  assert.ok(logs.some(x => x.event === 'job_skipped' && x.id === 'abcd00000001'));
+  assert.ok(!logs.some(x => x.event === 'first_card_recovered'));
+});
+
+test('export JSON and debug clearly identify an active run as partial', async () => {
+  const h = harness({ pages: [4], limit: 10 });
+  h.button('start').click();
+  h.button('json').click();
+  h.button('debug').click();
+  h.button('txt').click();
+  assert.equal(h.downloads.length, 3);
+  const jobs = JSON.parse(h.downloads[0]);
+  const debug = JSON.parse(h.downloads[1]);
+  const txt = h.downloads[2];
+  assert.equal(jobs.extractionState.status, 'in_progress');
+  assert.equal(jobs.extractionState.partialSnapshot, true);
+  assert.equal(debug.extractionState.status, 'in_progress');
+  assert.match(txt, /PARTIAL SNAPSHOT - STILL RUNNING/);
+  await h.finished();
 });

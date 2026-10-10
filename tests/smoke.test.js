@@ -10,19 +10,24 @@ const test = require('node:test');
 
 const source = fs.readFileSync(path.join(__dirname, '..', 'indeed-job-extractor.user.js'), 'utf8');
 
-function harness({ initial = 2, limit = 10, batches = [2, 2], preSaved = [], activateViaWrapper = false, pages = null, aliasAt = -1, startPage = 0, initialStorage = null, paginationClickNoOp = false, paginationHrefMode = 'normal', preloadedFirstPane = false } = {}) {
+function harness({ initial = 2, limit = 10, batches = [2, 2], preSaved = [], activateViaWrapper = false, pages = null, aliasAt = -1, startPage = 0, initialStorage = null, paginationClickNoOp = false, paginationHrefMode = 'normal', preloadedFirstPane = false, aliasOfAt = null, alsoMatchAt = -1, differentCompanyAt = -1 } = {}) {
   const storage = new Map(initialStorage || []);
   if (preSaved.length) storage.set('IJE_V01_jobs', JSON.stringify(preSaved));
   storage.set('IJE_V01_limit', JSON.stringify(limit));
   const all = Array.from({ length: pages ? pages.reduce((a, b) => a + b, 0) : initial + batches.reduce((a, b) => a + b, 0) }, (_, i) => ({
     id: `abcd${String(i + 1).padStart(8, '0')}`,
     title: `Job Title ${i + 1}`,
+    company: i === differentCompanyAt ? 'Different Corp' : 'Example Corp',
     description: `Job description ${i + 1} and relevant technical experience. `.repeat(3)
   }));
-  if (aliasAt >= 1 && all[aliasAt]) {
+  const sourceIndex = aliasOfAt ?? aliasAt - 1;
+  if (alsoMatchAt >= 0 && all[alsoMatchAt] && all[sourceIndex]) {
+    all[alsoMatchAt].title = all[sourceIndex].title;
+  }
+  if (aliasAt >= 1 && all[aliasAt] && all[sourceIndex]) {
     all[aliasAt].id = 'abcdef0123456789';
-    all[aliasAt].title = all[aliasAt - 1].title;
-    all[aliasAt].description = all[aliasAt - 1].description;
+    all[aliasAt].title = all[sourceIndex].title;
+    all[aliasAt].description = all[sourceIndex].description;
   }
   let visible = pages ? pages[startPage] : initial;
   let activePage = startPage;
@@ -57,9 +62,9 @@ function harness({ initial = 2, limit = 10, batches = [2, 2], preSaved = [], act
     const card = {
       tagName: 'DIV',
       click: () => { if (i !== aliasAt) { selected = job; urlSelected = job; } wrapperActivations++; },
-      innerText: `${job.title} Example Corp Rome`,
+      innerText: `${job.title} ${job.company} Rome`,
       querySelector: selector => selector.includes('company') || selector.includes('companyName')
-        ? { innerText: 'Example Corp' }
+        ? { innerText: job.company }
         : { innerText: 'Rome' }
     };
     const clickHandlers = new Set();
@@ -303,7 +308,7 @@ test('classifies unreachable duplicate alias without storing stale detail text',
   await h.finished();
   const { jobs, logs } = h.stats();
   assert.equal(jobs.length, 3);
-  assert.equal(logs.filter(e => e.event === 'duplicate_alias_skipped').length, 1);
+  assert.equal(logs.filter(e => e.event === 'possible_duplicate_unverified').length, 1);
   assert.equal(logs.find(e => e.event === 'run_finished')?.aliases, 1);
   assert.equal(logs.find(e => e.event === 'run_finished')?.errors, 0);
   assert.equal(jobs.some(job => job.id === 'abcdef0123456789'), false);
@@ -418,4 +423,65 @@ test('homepage infinite scroll also exports a safe terminal navigation diagnosis
   assert.equal(diagnostic.sourcePath, '/');
   assert.equal(diagnostic.paginationRootFound, false);
   assert.equal(diagnostic.candidatePageLinks.length, 0);
+});
+
+
+test('matches unreachable card against earlier verified jobs, not the current pane only', async () => {
+  const h = harness({ initial: 6, limit: 10, batches: [], aliasAt: 4, aliasOfAt: 1 });
+  h.button('start').click();
+  await h.finished();
+  const { jobs, logs } = h.stats();
+  const match = logs.find(entry => entry.event === 'possible_duplicate_unverified');
+  const run = logs.find(entry => entry.event === 'run_finished');
+  assert.equal(jobs.length, 5);
+  assert.equal(run.errors, 0);
+  assert.equal(run.aliases, 1);
+  assert.equal(match?.id, 'abcdef0123456789');
+  assert.equal(match?.possibleDuplicateOf, 'abcd00000002');
+  assert.equal(match?.verified, false);
+  assert.equal(jobs.some(job => job.id === 'abcdef0123456789'), false);
+  const ledger = JSON.parse(h.storage.get('IJE_V01_unverified'));
+  assert.equal(ledger[0].status, 'possible_duplicate');
+  assert.equal(ledger[0].possibleMatches[0].id, 'abcd00000002');
+});
+
+test('same title with different company is not classified as a duplicate', async () => {
+  const h = harness({ initial: 5, limit: 10, batches: [], aliasAt: 3, aliasOfAt: 0, differentCompanyAt: 3 });
+  h.button('start').click();
+  await h.finished();
+  const { jobs, logs } = h.stats();
+  const run = logs.find(entry => entry.event === 'run_finished');
+  assert.equal(jobs.length, 4);
+  assert.equal(run.errors, 1);
+  assert.equal(run.aliases, 0);
+  assert.equal(logs.filter(entry => entry.event === 'possible_duplicate_unverified').length, 0);
+  const ledger = JSON.parse(h.storage.get('IJE_V01_unverified'));
+  assert.equal(ledger[0].status, 'unreachable');
+});
+
+test('multiple candidate duplicates remain an unresolved ambiguity', async () => {
+  const h = harness({ initial: 6, limit: 10, batches: [], aliasAt: 4, aliasOfAt: 0, alsoMatchAt: 2 });
+  h.button('start').click();
+  await h.finished();
+  const { jobs, logs } = h.stats();
+  const run = logs.find(entry => entry.event === 'run_finished');
+  assert.equal(jobs.length, 5);
+  assert.equal(run.errors, 1);
+  assert.equal(run.aliases, 0);
+  const skipped = logs.find(entry => entry.event === 'job_skipped');
+  assert.equal(skipped?.candidateCount, 2);
+  const ledger = JSON.parse(h.storage.get('IJE_V01_unverified'));
+  assert.equal(ledger[0].status, 'ambiguous_matches');
+  assert.equal(ledger[0].possibleMatches.length, 2);
+});
+
+test('successful later extraction clears a previous unverified record', async () => {
+  const initialStorage = [['IJE_V01_unverified', JSON.stringify([{
+    id: 'abcd00000001', title: 'Job Title 1', status: 'unreachable'
+  }])]];
+  const h = harness({ initial: 2, limit: 1, batches: [], initialStorage });
+  h.button('start').click();
+  await h.finished();
+  assert.ok(h.stats().jobs.some(job => job.id === 'abcd00000001'));
+  assert.deepEqual(JSON.parse(h.storage.get('IJE_V01_unverified')), []);
 });

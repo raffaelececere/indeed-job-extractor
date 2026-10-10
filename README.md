@@ -1,6 +1,6 @@
 # Indeed Job Extractor
 
-**Version 0.2.0 — public beta candidate (automated smoke tests passed; live-browser validation pending).**
+**Version 0.3.0 — public beta (six simulated-DOM tests passed; revalidation on live Indeed required).**
 
 A standalone [Tampermonkey](https://www.tampermonkey.net/) userscript for collecting Indeed job listings, including their full visible descriptions, to review in JSON or TXT format. It operates in your browser through Indeed's existing interface; no API key, server, or build process is needed.
 
@@ -11,6 +11,8 @@ This is an independent, unofficial project and is not affiliated with, endorsed 
 - **Configurable collection limit:** 10, 25, 50, 100, 250, or 500 *new listings examined per run*.
 - **Bounded infinite-scroll discovery:** when currently discovered jobs are exhausted, attempts to scroll the results list to reveal further cards; stops after five attempts without any new job IDs.
 - **Sequential extraction:** selects one job at a time using the existing Indeed UI, rather than initiating competing requests to the same mutable details pane.
+- **Guarded card activation (v0.3):** cancels native link navigation when programmatically selecting a job. If the regular selection does not update the pane, tries a non-link card wrapper instead; a failed selection is logged rather than blindly following the job URL.
+- **Interrupted-run diagnostics:** persists the active-run marker so an unexpected page navigation can be identified on the next load.
 - **Job validation:** checks the `data-jk` card ID against the `vjk` URL parameter, verifies that the details-pane heading begins with the expected title, waits for stable description content, and rejects uncertain captures.
 - **Duplicate detection:** preserves saved entries by Indeed job ID and skips them in future runs.
 - **Persistent local storage:** retains extracted jobs and configuration between runs and browser refreshes.
@@ -43,7 +45,7 @@ The limit counts *newly examined listings in the current run*, including unsucce
 ```json
 {
   "generator": "Indeed Job Extractor",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "exportedAt": "2026-10-10T16:00:00.000Z",
   "jobCount": 1,
   "jobs": [
@@ -79,6 +81,7 @@ Indeed is a dynamic website. Not all layouts provide the same selectors, loading
 
 - Only DOM-loaded job cards accessible from the current page can be discovered. The script does **not** crawl the entire Indeed database or automatically change search filters.
 - Infinite scrolling is **best effort**, dependent on the actual results-list scroll container and Indeed's UI behaviour. Some searches may paginate, require a button, or stop loading more items.
+- **Page navigation is a known compatibility risk.** v0.2.0 followed a native job link during an extraction on the Italian homepage. v0.3.0 adds a cancellation guard and stops on detected route changes, but this needs testing on real pages: third-party page handlers may still initiate navigation.
 - “No more jobs detected” means no new job IDs were detected within the configured bounded attempts, not proof that no other jobs exist online.
 - The description is the **visible DOM text**, not a guarantee of all information on external application pages.
 - Some listings may share titles or appear in sponsored placements. Job ID validation and conservative failure handling reduce, but cannot completely eliminate, UI-race risks.
@@ -99,7 +102,7 @@ node --check indeed-job-extractor.user.js
 node --test tests/smoke.test.js
 ```
 
-These tests cover limited extraction, progressive discovery, automatic stopping and saved-ID deduplication, **not** a real Indeed session. A live validation pass should confirm the details-pane synchronization, DOM behaviour and scrolling implementation before increasing the collection limit.
+These tests cover limited extraction, progressive discovery, automatic stopping, saved-ID deduplication, native link-navigation prevention and a non-link activation fallback, **not** a real Indeed session. A live validation pass should confirm the details-pane synchronization, DOM behaviour and scrolling implementation before increasing the collection limit.
 
 ## Project structure
 

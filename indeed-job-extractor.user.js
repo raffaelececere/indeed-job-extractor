@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Indeed Job Extractor
 // @namespace    https://github.com/raffaelececere
-// @version      0.4.0
+// @version      0.4.1
 // @description  Collect Indeed job listings with bounded infinite-scroll discovery, verified descriptions, local storage and JSON/TXT exports.
 // @author       Raffaele Marco Cecere
 // @homepageURL  https://github.com/raffaelececere/indeed-job-extractor
@@ -21,7 +21,7 @@
 
   if (window.top !== window.self || document.getElementById('ije-root')) return;
 
-  const VERSION = '0.4.0';
+  const VERSION = '0.4.1';
   // Preserve v0.1 saved results and diagnostics after an upgrade.
   const PREFIX = 'IJE_V01_';
   const LIMITS = [10, 25, 50, 100, 250, 500];
@@ -243,13 +243,33 @@
 
   // Search-result pages use pagination; homepage feeds may use infinite scroll.
   // Use Indeed's real UI controls, never fabricated pagination links.
+  // Indeed may append/remove tracking and UI-only parameters when moving
+  // between search result pages. Query/location are the stable resume key.
+  // Only explicitly conflicting search criteria on both URLs block a click.
   function searchKey(raw = location.href) {
     try {
       const u = new URL(raw, location.href);
-      for (const name of ['start', 'page', 'p', 'vjk', 'jk', 'from']) u.searchParams.delete(name);
-      const values = [...u.searchParams.entries()].sort(([a, av], [b, bv]) => a.localeCompare(b) || av.localeCompare(bv));
-      return `${u.origin}${u.pathname}?${new URLSearchParams(values)}`;
+      const core = new URLSearchParams();
+      for (const name of ['q', 'l']) {
+        const value = u.searchParams.get(name);
+        if (value !== null) core.set(name, clean(value).toLocaleLowerCase());
+      }
+      return `${u.origin}${u.pathname}?${core.toString()}`;
     } catch { return location.pathname; }
+  }
+  function changedExplicitSearchFields(destinationHref) {
+    try {
+      const from = new URL(location.href);
+      const to = new URL(destinationHref, location.href);
+      const keys = [
+        'q', 'l', 'radius', 'jt', 'salary', 'fromage',
+        'remotejob', 'as_and', 'as_phr', 'as_any', 'as_not',
+        'as_ttl', 'as_cmp', 'as_src'
+      ];
+      return keys.filter(name => from.searchParams.has(name)
+        && to.searchParams.has(name)
+        && from.searchParams.getAll(name).join('\u0000') !== to.searchParams.getAll(name).join('\u0000'));
+    } catch { return ['invalid_url']; }
   }
   function pageKey(raw = location.href) {
     try {
@@ -401,7 +421,8 @@
       return;
     }
     const restored = resume ? read('activeRun', null) : null;
-    if (resume && (!restored?.navigationPending || restored.searchKey !== searchKey()
+    if (resume && (!restored?.navigationPending
+      || (restored.searchKey !== searchKey() && restored.destinationPageKey !== pageKey())
       || restored.fromPageKey === pageKey())) return;
     running = true;
     stopRequested = false;
@@ -426,12 +447,13 @@
     let consecutiveErrors = 0;
     let endReason = 'completed';
     const initialPath = location.pathname;
-    function saveCheckpoint(navigationPending = false) {
+    function saveCheckpoint(navigationPending = false, destinationHref = null) {
       write('activeRun', {
         startedAtMs: started, searchKey: searchKey(), target, examined, savedNew,
         skippedExisting, errors, aliases, pagesProcessed,
         seen: [...seen], visited: [...visited], seenPages: [...seenPages],
-        navigationPending, fromPageKey: pageKey()
+        navigationPending, fromPageKey: pageKey(),
+        destinationPageKey: navigationPending && destinationHref ? pageKey(destinationHref) : null
       });
     }
     saveCheckpoint();
@@ -460,10 +482,19 @@
       if (!control) return 'no_next_page';
       const targetHref = control.href || null;
       if (targetHref && seenPages.has(pageKey(targetHref))) return 'pagination_loop';
-      if (targetHref && searchKey(targetHref) !== searchKey()) return 'pagination_search_changed';
+      if (targetHref) {
+        const changedFields = changedExplicitSearchFields(targetHref);
+        if (changedFields.length) {
+          log('warn', 'pagination_search_mismatch', {
+            changedFields,
+            fromPage: pageKey(), destinationPage: pageKey(targetHref)
+          });
+          return 'pagination_search_changed';
+        }
+      }
       const beforeIds = new Set(cardsNow().keys());
       const fromKey = pageKey();
-      saveCheckpoint(true);
+      saveCheckpoint(true, targetHref);
       log('info', 'pagination_next', {
         page: pagesProcessed, from: fromKey,
         destination: targetHref ? pageKey(targetHref) : 'UI control'
@@ -739,7 +770,8 @@
   if (interruptedRun) {
     const canResume = interruptedRun.navigationPending
       && /^\/jobs\/?$/.test(location.pathname)
-      && interruptedRun.searchKey === searchKey()
+      && (interruptedRun.searchKey === searchKey()
+        || interruptedRun.destinationPageKey === pageKey())
       && interruptedRun.fromPageKey !== pageKey()
       && Date.now() - interruptedRun.startedAtMs < CONFIG.maxRunMs;
     if (canResume) {

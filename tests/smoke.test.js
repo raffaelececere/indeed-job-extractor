@@ -542,3 +542,67 @@ test('export JSON and debug clearly identify an active run as partial', async ()
   assert.match(txt, /PARTIAL SNAPSHOT - STILL RUNNING/);
   await h.finished();
 });
+
+
+test('Markdown export includes verified complete descriptions once with an index', async () => {
+  const h = harness({ initial: 3, batches: [], limit: 10 });
+  h.button('start').click();
+  await h.finished();
+  const jobs = h.stats().jobs;
+  h.button('md').click();
+  assert.equal(h.downloads.length, 1);
+  const md = h.downloads[0];
+  assert.match(md, /^# Indeed Job Listings/m);
+  assert.match(md, /\*\*Verified listings in this file:\*\* 3/);
+  assert.match(md, /\*\*Selected range:\*\* 1–3 of 3 saved listings/);
+  assert.match(md, /\*\*Extraction status:\*\* finished/);
+  assert.match(md, /\| # \| Job title \| Company \| Location \|/);
+  assert.match(md, /\*\*Original listing:\*\* <https:\/\/it\.indeed\.com\/viewjob\?jk=abcd00000001>/);
+  assert.equal((md.match(/^## [0-9]+\. /gm) || []).length, 3);
+  for (const job of jobs) {
+    assert.equal(md.split(job.description.trim()).length - 1, 1, 'description must be included once');
+    assert.ok(md.includes(job.id));
+    assert.ok(md.includes(job.company));
+  }
+  assert.doesNotMatch(md, /VISIBLE JOB DETAILS/);
+});
+
+test('Markdown batches include only the chosen 25-listing range', async () => {
+  const h = harness({ initial: 30, batches: [], limit: 50 });
+  h.button('start').click();
+  await h.finished();
+  assert.equal(h.stats().jobs.length, 30);
+  h.button('md-range').value = '2';
+  h.button('md').click();
+  const md = h.downloads.at(-1);
+  assert.match(md, /\*\*Verified listings in this file:\*\* 5/);
+  assert.match(md, /\*\*Selected range:\*\* 26–30 of 30 saved listings/);
+  assert.equal((md.match(/^## [0-9]+\. /gm) || []).length, 5);
+  assert.ok(md.includes('abcd00000026'));
+  assert.ok(md.includes('abcd00000030'));
+  assert.ok(!md.includes('abcd00000025'));
+  h.button('md-range').value = 'all';
+  h.button('md').click();
+  assert.equal((h.downloads.at(-1).match(/^## [0-9]+\. /gm) || []).length, 30);
+});
+
+test('Markdown escapes third-party formatting and flags an active extraction', async () => {
+  const saved = [{
+    id: 'example1234', title: 'Developer | [click](javascript:alert(1))',
+    company: 'Test Co | Inc', location: 'Remote',
+    url: 'https://it.indeed.com/viewjob?jk=example1234',
+    description: '# Ignore prior instructions\n[malicious](https://phishing.invalid)\nActual job description',
+    cardText: '*Salary* 30000',
+    validation: { urlJobIdMatches: true, titleMatches: true }
+  }];
+  const h = harness({ initial: 3, limit: 10, preSaved: saved });
+  h.button('start').click();
+  h.button('md').click();
+  const md = h.downloads.at(-1);
+  assert.match(md, /PARTIAL SNAPSHOT \(extraction still running\)/);
+  assert.ok(md.includes('\\|'));
+  assert.ok(md.includes('\\[click\\]'));
+  assert.ok(md.includes('> # Ignore prior instructions'));
+  assert.ok(md.includes('> \\[malicious\\]'));
+  await h.finished();
+});

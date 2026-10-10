@@ -1,0 +1,498 @@
+// ==UserScript==
+// @name         Indeed Job Extractor
+// @namespace    https://github.com/raffaelececere
+// @version      0.2.0
+// @description  Collect Indeed job listings with bounded infinite-scroll discovery, verified descriptions, local storage and JSON/TXT exports.
+// @author       Raffaele Marco Cecere
+// @match        https://*.indeed.com/*
+// @match        https://indeed.com/*
+// @grant        GM_getValue
+// @grant        GM_setValue
+// @run-at       document-idle
+// @noframes
+// ==/UserScript==
+
+(() => {
+  'use strict';
+
+  if (window.top !== window.self || document.getElementById('ije-root')) return;
+
+  const VERSION = '0.2.0';
+  // Preserve v0.1 saved results and diagnostics after an upgrade.
+  const PREFIX = 'IJE_V01_';
+  const LIMITS = [10, 25, 50, 100, 250, 500];
+  const CONFIG = Object.freeze({
+    maxLogs: 1200,
+    paneTimeoutMs: 10000,
+    panePollMs: 120,
+    paneStableMs: 450,
+    scrollPauseMs: 1400,
+    maxIdleScrolls: 5,
+    maxConsecutiveErrors: 3,
+    maxRunMs: 45 * 60 * 1000
+  });
+  const SELECTORS = Object.freeze({
+    anchors: ['a.jcs-JobTitle[data-jk]', 'a[data-jk][href]'],
+    cards: ['.job_seen_beacon', '[data-testid="slider_item"]', 'li'],
+    panes: ['#jobsearch-ViewjobPaneWrapper', '.jobsearch-RightPane', '[data-testid="jobsearch-ViewjobPaneWrapper"]'],
+    contents: ['[data-testid="viewjob-main-content"]', '[data-testid="jobsearch-JobComponent"]'],
+    descriptions: ['.simple-job-description-html', '#jobDescriptionText']
+  });
+
+  const clean = value => String(value || '').replace(/\s+/g, ' ').trim();
+  const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
+  const idValid = id => /^[a-z0-9]{8,40}$/i.test(id || '');
+  const firstWithin = (root, selectors) => {
+    for (const selector of selectors) {
+      const element = root?.querySelector(selector);
+      if (element) return element;
+    }
+    return null;
+  };
+  const safeParse = (str, fallback) => {
+    try { return JSON.parse(str); } catch { return fallback; }
+  };
+  const read = (key, fallback) => {
+    try { return safeParse(GM_getValue(PREFIX + key, JSON.stringify(fallback)), fallback); }
+    catch { return fallback; }
+  };
+  const write = (key, value) => {
+    try { GM_setValue(PREFIX + key, JSON.stringify(value)); return true; }
+    catch { return false; }
+  };
+  const safeHost = () => /(^|\.)indeed\.com$/i.test(location.hostname) ? location.hostname : 'www.indeed.com';
+  const canonicalUrl = id => `https://${safeHost()}/viewjob?jk=${encodeURIComponent(id)}`;
+
+  const jobs = new Map();
+  const storedJobs = read('jobs', []);
+  for (const job of Array.isArray(storedJobs) ? storedJobs : []) {
+    if (idValid(job?.id)) jobs.set(job.id, job);
+  }
+  let logs = read('logs', []);
+  if (!Array.isArray(logs)) logs = [];
+  let running = false;
+  let stopRequested = false;
+  let minimized = false;
+  let status = 'Ready';
+  let examined = 0;
+  let discovered = 0;
+  let skippedExisting = 0;
+  let errors = 0;
+  let target = 25;
+  let idleScrolls = 0;
+  let lastRun = null;
+
+  function log(level, event, fields = {}) {
+    const entry = { at: new Date().toISOString(), level, event, ...fields };
+    logs.push(entry);
+    if (logs.length > CONFIG.maxLogs) logs = logs.slice(-CONFIG.maxLogs);
+    write('logs', logs);
+    const fn = level === 'error' ? 'error' : level === 'warn' ? 'warn' : 'debug';
+    console[fn]('[Indeed Job Extractor]', event, fields);
+  }
+
+  function cardsNow() {
+    const result = new Map();
+    for (const anchor of document.querySelectorAll(SELECTORS.anchors.join(','))) {
+      const id = anchor.getAttribute('data-jk') || anchor.closest('[data-jk]')?.getAttribute('data-jk');
+      if (!idValid(id) || result.has(id)) continue;
+      const card = anchor.closest(SELECTORS.cards.join(','));
+      if (!card) continue;
+      const title = clean(anchor.innerText || anchor.textContent);
+      if (!title) continue;
+      const cardText = clean(card.innerText || card.textContent);
+      result.set(id, {
+        id,
+        title,
+        company: clean(firstWithin(card, ['.companyName', '[data-testid="company-name"]'])?.innerText) || null,
+        location: clean(firstWithin(card, ['.companyLocation', '[data-testid="text-location"]', '[data-testid="job-location"]'])?.innerText) || null,
+        cardText,
+        sponsored: /\b(annuncio|sponsored|promoted)\b/i.test(cardText)
+      });
+    }
+    return result;
+  }
+
+  function currentId() {
+    try { return new URL(location.href).searchParams.get('vjk'); }
+    catch { return null; }
+  }
+  function paneSnapshot() {
+    const pane = firstWithin(document, SELECTORS.panes);
+    const content = firstWithin(pane, SELECTORS.contents);
+    const descriptionEl = firstWithin(content || pane, SELECTORS.descriptions);
+    if (!pane || !content || !descriptionEl) return null;
+    const detail = clean(content.innerText || content.textContent);
+    const description = clean(descriptionEl.innerText || descriptionEl.textContent);
+    return { detail, description, descriptionLength: description.length };
+  }
+  function titleMatches(detail, title) {
+    const normalizedTitle = clean(title).toLocaleLowerCase();
+    const beginning = clean(detail).slice(0, Math.max(title.length + 40, 180)).toLocaleLowerCase();
+    return !!normalizedTitle && beginning.startsWith(normalizedTitle);
+  }
+  function findAnchor(id) {
+    for (const anchor of document.querySelectorAll(SELECTORS.anchors.join(','))) {
+      if (anchor.getAttribute('data-jk') === id && anchor.closest(SELECTORS.cards.join(','))) return anchor;
+    }
+    return null;
+  }
+  async function waitForPane(card, previous) {
+    const deadline = Date.now() + CONFIG.paneTimeoutMs;
+    let signature = null;
+    let stableSince = 0;
+    let reason = 'timeout';
+    while (Date.now() < deadline) {
+      if (stopRequested) return { ok: false, reason: 'stopped' };
+      const jobId = currentId();
+      const snap = paneSnapshot();
+      if (jobId !== card.id) reason = `URL ID mismatch (${jobId || 'none'})`;
+      else if (!snap || snap.descriptionLength < 60) reason = 'description missing or too short';
+      else if (!titleMatches(snap.detail, card.title)) reason = 'pane title differs from card';
+      else if (previous && previous.id !== card.id && previous.detail === snap.detail) reason = 'pane content unchanged';
+      else {
+        const nextSignature = `${jobId}\n${snap.detail}\n${snap.description}`;
+        if (signature !== nextSignature) {
+          signature = nextSignature;
+          stableSince = Date.now();
+        }
+        if (Date.now() - stableSince >= CONFIG.paneStableMs) return { ok: true, snap };
+      }
+      await sleep(CONFIG.panePollMs);
+    }
+    return { ok: false, reason };
+  }
+  function saveJobs() {
+    const ok = write('jobs', [...jobs.values()]);
+    if (!ok) log('error', 'storage_failure', { saved: jobs.size });
+    return ok;
+  }
+
+  // The scroll container must belong to the job list, never to the details pane.
+  // On layouts using document scrolling, fall back to the document scroller.
+  function findListScroller() {
+    const anchors = [...document.querySelectorAll(SELECTORS.anchors.join(','))];
+    const last = anchors.at(-1);
+    if (!last) return document.scrollingElement || document.documentElement;
+    let element = last.parentElement;
+    while (element && element !== document.body && element !== document.documentElement) {
+      const style = getComputedStyle(element);
+      if (/auto|scroll/i.test(style.overflowY) && element.scrollHeight > element.clientHeight + 24) {
+        return element;
+      }
+      element = element.parentElement;
+    }
+    return document.scrollingElement || document.documentElement;
+  }
+  function scrollForMore() {
+    const anchors = [...document.querySelectorAll(SELECTORS.anchors.join(','))];
+    const last = anchors.at(-1);
+    const scroller = findListScroller();
+    if (!scroller) return 'no_scroller';
+    if (last) last.scrollIntoView({ block: 'end', inline: 'nearest', behavior: 'instant' });
+    if (scroller === document.scrollingElement || scroller === document.documentElement || scroller === document.body) {
+      window.scrollTo({ top: (document.scrollingElement || document.documentElement).scrollHeight, behavior: 'instant' });
+      return 'document';
+    }
+    scroller.scrollTop = scroller.scrollHeight;
+    scroller.dispatchEvent(new Event('scroll', { bubbles: true }));
+    return 'nested_container';
+  }
+
+  const root = document.createElement('div');
+  root.id = 'ije-root';
+  root.style.cssText = 'position:fixed;z-index:2147483647;top:88px;right:20px;';
+  document.documentElement.appendChild(root);
+  const shadow = root.attachShadow({ mode: 'open' });
+  shadow.innerHTML = `
+    <style>
+      *{box-sizing:border-box}:host{all:initial}
+      .panel{width:318px;background:#151c2b;color:#edf2ff;border:1px solid #36445b;border-radius:12px;box-shadow:0 12px 36px #0006;font:13px/1.42 Arial,Helvetica,sans-serif;overflow:hidden}
+      .head{padding:12px 14px;background:#202c40;display:flex;align-items:center;justify-content:space-between;cursor:move;user-select:none}
+      .brand{font-weight:700;font-size:14px}.version{font-size:11px;color:#b9c5d8;margin-left:5px}
+      .body{padding:13px}.status{color:#bcd2ee;margin-bottom:9px;overflow-wrap:anywhere;min-height:19px}
+      .choice{display:flex;align-items:center;gap:10px;margin-bottom:10px;color:#dce5f5;font-size:12px}
+      select{margin-left:auto;background:#253750;border:1px solid #566b8a;color:white;border-radius:6px;padding:5px 8px;font-weight:700;min-width:105px}
+      select:disabled{opacity:.55}
+      .progress{height:7px;background:#39485d;border-radius:6px;overflow:hidden;margin:10px 0}
+      .fill{height:100%;width:0;background:#65adff;transition:width .2s}
+      .stats{display:grid;grid-template-columns:1fr 1fr;gap:6px;margin-bottom:12px;color:#d2dbea}
+      .stats strong{color:#fff}.buttons{display:grid;grid-template-columns:1fr 1fr;gap:7px}
+      button{border:1px solid #53647b;border-radius:7px;background:#2b3950;color:white;padding:8px 7px;cursor:pointer;font-weight:600;font-size:12px}
+      button:hover:not(:disabled){background:#3c4f6d}button:disabled{opacity:.4;cursor:default}
+      .primary{background:#1965bd;border-color:#3680d0}.primary:hover:not(:disabled){background:#277bd7}
+      .danger{background:#512c36;border-color:#75505a}.small{padding:2px 7px;font-size:17px;line-height:1.2}
+      .hint{font-size:11px;line-height:1.45;color:#abbad0;margin-top:10px}
+      .mini{position:fixed;right:18px;top:88px;border-radius:20px;padding:9px 13px;background:#202c40}
+      [hidden]{display:none!important}
+    </style>
+    <section class="panel" aria-label="Indeed Job Extractor">
+      <div class="head" id="drag"><span class="brand">Indeed Job Extractor <span class="version">v${VERSION}</span></span><button class="small" id="minimize" title="Minimize panel" aria-label="Minimize">−</button></div>
+      <div class="body">
+        <div class="status" id="status">Ready</div>
+        <label class="choice" for="limit">New jobs to examine <select id="limit">${LIMITS.map(n => `<option value="${n}">${n} jobs</option>`).join('')}</select></label>
+        <div class="progress"><div class="fill" id="fill"></div></div>
+        <div class="stats">
+          <span>Visible cards: <strong id="cards">0</strong></span><span>Examined: <strong id="progress">0/25</strong></span>
+          <span>Discovered: <strong id="discovered">0</strong></span><span>Saved total: <strong id="saved">0</strong></span>
+          <span>Existing skipped: <strong id="skipped">0</strong></span><span>Errors: <strong id="errors">0</strong></span>
+        </div>
+        <div class="buttons">
+          <button class="primary" id="start">START EXTRACTION</button><button id="stop" disabled>STOP</button>
+          <button id="json">EXPORT JSON</button><button id="txt">EXPORT TXT</button>
+          <button id="debug">DEBUG LOG</button><button class="danger" id="clear">CLEAR SAVED</button>
+        </div>
+        <div class="hint">Bounded scroll discovery · Sequential extraction · Automatic stop at job limit or after ${CONFIG.maxIdleScrolls} scroll attempts without new listings. Existing jobs remain saved locally.</div>
+      </div>
+    </section>
+    <button class="mini" id="reopen" hidden>Indeed Extractor</button>`;
+  const ui = id => shadow.getElementById(id);
+  const savedLimit = Number(read('limit', 25));
+  ui('limit').value = String(LIMITS.includes(savedLimit) ? savedLimit : 25);
+  target = Number(ui('limit').value);
+
+  function updateUI() {
+    ui('status').textContent = status;
+    ui('cards').textContent = String(cardsNow().size);
+    ui('progress').textContent = `${examined}/${target}`;
+    ui('discovered').textContent = String(discovered);
+    ui('saved').textContent = String(jobs.size);
+    ui('skipped').textContent = String(skippedExisting);
+    ui('errors').textContent = String(errors);
+    ui('fill').style.width = `${Math.min(100, (examined / target) * 100)}%`;
+    ui('start').disabled = running;
+    ui('stop').disabled = !running;
+    ui('limit').disabled = running;
+    ui('clear').disabled = running;
+    ui('reopen').hidden = !minimized;
+    shadow.querySelector('.panel').hidden = minimized;
+  }
+
+  async function extract() {
+    if (running) return;
+    if (!cardsNow().size) {
+      status = 'No job cards found. Open an Indeed results list.';
+      updateUI();
+      return;
+    }
+    running = true;
+    stopRequested = false;
+    examined = discovered = skippedExisting = errors = idleScrolls = 0;
+    target = Number(ui('limit').value);
+    write('limit', target);
+    const started = Date.now();
+    const known = new Map();
+    const visited = new Set();
+    let previous = null;
+    let consecutiveErrors = 0;
+    let endReason = 'completed';
+    log('info', 'run_started', { path: location.pathname, target, alreadySaved: jobs.size });
+
+    function discover() {
+      let added = 0;
+      for (const [id, card] of cardsNow()) {
+        if (!known.has(id)) {
+          added++;
+          if (jobs.has(id)) skippedExisting++;
+        }
+        known.set(id, card);
+      }
+      discovered = known.size;
+      return added;
+    }
+
+    try {
+      discover();
+      updateUI();
+      while (!stopRequested && examined < target) {
+        if (Date.now() - started > CONFIG.maxRunMs) {
+          endReason = 'run_timeout';
+          log('warn', 'run_timeout', { elapsedMs: Date.now() - started });
+          break;
+        }
+        discover();
+        const next = [...known.values()].find(card => !visited.has(card.id) && !jobs.has(card.id));
+        if (!next) {
+          if (idleScrolls >= CONFIG.maxIdleScrolls) {
+            endReason = 'no_more_jobs';
+            break;
+          }
+          status = `Finding more jobs… (${idleScrolls + 1}/${CONFIG.maxIdleScrolls})`;
+          updateUI();
+          const scrollMode = scrollForMore();
+          await sleep(CONFIG.scrollPauseMs);
+          const added = discover();
+          log('info', 'scroll_discovery', { mode: scrollMode, added, uniqueDiscovered: discovered });
+          idleScrolls = added ? 0 : idleScrolls + 1;
+          updateUI();
+          continue;
+        }
+        idleScrolls = 0;
+        visited.add(next.id);
+        examined++;
+        const anchor = findAnchor(next.id);
+        if (!anchor) {
+          errors++;
+          consecutiveErrors++;
+          status = `Card disappeared: ${next.title}`;
+          log('warn', 'card_disappeared', { id: next.id, title: next.title });
+          updateUI();
+        } else {
+          status = `Reading ${examined}/${target}: ${next.title}`;
+          updateUI();
+          const prior = paneSnapshot();
+          const priorId = currentId();
+          try {
+            anchor.click();
+            const result = await waitForPane(next, prior ? { ...prior, id: priorId } : previous);
+            if (result.ok) {
+              const snap = result.snap;
+              jobs.set(next.id, {
+                id: next.id,
+                title: next.title,
+                company: next.company,
+                location: next.location,
+                sponsored: next.sponsored,
+                url: canonicalUrl(next.id),
+                sourceDomain: safeHost(),
+                sourcePath: location.pathname,
+                extractedAt: new Date().toISOString(),
+                description: snap.description,
+                descriptionLength: snap.descriptionLength,
+                detailText: snap.detail,
+                cardText: next.cardText,
+                validation: { urlJobIdMatches: true, titleMatches: true, stableForMs: CONFIG.paneStableMs }
+              });
+              saveJobs();
+              previous = { ...snap, id: next.id };
+              consecutiveErrors = 0;
+              log('info', 'job_saved', { id: next.id, title: next.title, descriptionLength: snap.descriptionLength });
+            } else if (result.reason === 'stopped') {
+              stopRequested = true;
+            } else {
+              errors++;
+              consecutiveErrors++;
+              log('warn', 'job_skipped', { id: next.id, title: next.title, reason: result.reason, currentVjk: currentId() });
+            }
+          } catch (error) {
+            errors++;
+            consecutiveErrors++;
+            log('error', 'job_exception', { id: next.id, message: String(error?.message || error) });
+          }
+          updateUI();
+        }
+        if (consecutiveErrors >= CONFIG.maxConsecutiveErrors) {
+          endReason = 'consecutive_errors';
+          log('error', 'error_threshold_reached', { examined, errors });
+          break;
+        }
+        if (!stopRequested) await sleep(240);
+      }
+      if (stopRequested) endReason = 'user_stop';
+      else if (examined >= target) endReason = 'job_limit_reached';
+    } finally {
+      running = false;
+      stopRequested = false;
+      lastRun = {
+        finishedAt: new Date().toISOString(),
+        target, examined, discovered, skippedExisting,
+        errors, idleScrolls, savedTotal: jobs.size, reason: endReason
+      };
+      status = endReason === 'job_limit_reached'
+        ? `Limit reached: ${examined} examined, ${jobs.size} saved total.`
+        : endReason === 'no_more_jobs'
+          ? `No more jobs detected: ${examined} examined.`
+          : endReason === 'user_stop'
+            ? 'Stopped manually. Partial results saved.'
+            : `Stopped (${endReason}). Export DEBUG LOG.`;
+      log('info', 'run_finished', lastRun);
+      updateUI();
+    }
+  }
+
+  function download(contents, name, mime) {
+    const blob = new Blob([contents], { type: mime });
+    const url = URL.createObjectURL(blob);
+    const anchor = document.createElement('a');
+    anchor.href = url;
+    anchor.download = name;
+    anchor.style.display = 'none';
+    document.body.appendChild(anchor);
+    anchor.click();
+    anchor.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 30000);
+  }
+  const fileName = (kind, ext) => `indeed_${kind}_${new Date().toISOString().replace(/[:.]/g, '-')}.${ext}`;
+  function exportJSON() {
+    download(JSON.stringify({
+      generator: 'Indeed Job Extractor', version: VERSION,
+      exportedAt: new Date().toISOString(), jobCount: jobs.size,
+      jobs: [...jobs.values()]
+    }, null, 2), fileName('jobs', 'json'), 'application/json;charset=utf-8');
+  }
+  function exportTXT() {
+    const lines = [`Indeed Job Extractor v${VERSION}`, `Exported: ${new Date().toISOString()}`, `Jobs: ${jobs.size}`, ''];
+    for (const job of jobs.values()) {
+      lines.push('='.repeat(76), `TITLE: ${job.title}`, `COMPANY: ${job.company || 'Not available'}`,
+        `LOCATION: ${job.location || 'Not available'}`, `JOB ID: ${job.id}`, `URL: ${job.url}`,
+        `SPONSORED: ${job.sponsored ? 'Yes' : 'No'}`, '', 'FULL DESCRIPTION:', job.description,
+        '', 'VISIBLE JOB DETAILS:', job.detailText, '', 'ORIGINAL CARD:', job.cardText, '');
+    }
+    download(lines.join('\n'), fileName('jobs', 'txt'), 'text/plain;charset=utf-8');
+  }
+  function exportDebug() {
+    download(JSON.stringify({
+      generator: 'Indeed Job Extractor', version: VERSION,
+      exportedAt: new Date().toISOString(), pagePath: location.pathname,
+      visibleCards: cardsNow().size, savedTotal: jobs.size, lastRun, logs
+    }, null, 2), fileName('debug', 'json'), 'application/json;charset=utf-8');
+  }
+
+  ui('limit').addEventListener('change', () => {
+    target = Number(ui('limit').value);
+    write('limit', target);
+    updateUI();
+  });
+  ui('start').addEventListener('click', () => { void extract(); });
+  ui('stop').addEventListener('click', () => {
+    stopRequested = true;
+    status = 'Stopping after current check…';
+    updateUI();
+  });
+  ui('json').addEventListener('click', exportJSON);
+  ui('txt').addEventListener('click', exportTXT);
+  ui('debug').addEventListener('click', exportDebug);
+  ui('clear').addEventListener('click', () => {
+    if (!confirm(`Delete ${jobs.size} locally saved listings and debug history?`)) return;
+    jobs.clear(); logs = [];
+    saveJobs(); write('logs', []);
+    examined = discovered = skippedExisting = errors = idleScrolls = 0;
+    lastRun = null;
+    status = 'Local saved data cleared.';
+    updateUI();
+  });
+  ui('minimize').addEventListener('click', () => { minimized = true; updateUI(); });
+  ui('reopen').addEventListener('click', () => { minimized = false; updateUI(); });
+
+  let drag = null;
+  ui('drag').addEventListener('pointerdown', e => {
+    if (e.target.closest('button')) return;
+    drag = {
+      x: e.clientX, y: e.clientY,
+      left: root.getBoundingClientRect().left,
+      top: root.getBoundingClientRect().top
+    };
+    ui('drag').setPointerCapture(e.pointerId);
+  });
+  ui('drag').addEventListener('pointermove', e => {
+    if (!drag) return;
+    root.style.right = 'auto';
+    root.style.left = `${Math.max(0, Math.min(innerWidth - 80, drag.left + e.clientX - drag.x))}px`;
+    root.style.top = `${Math.max(0, Math.min(innerHeight - 60, drag.top + e.clientY - drag.y))}px`;
+  });
+  ui('drag').addEventListener('pointerup', () => { drag = null; });
+  ui('drag').addEventListener('pointercancel', () => { drag = null; });
+
+  log('info', 'initialized', { version: VERSION, path: location.pathname, saved: jobs.size });
+  updateUI();
+})();

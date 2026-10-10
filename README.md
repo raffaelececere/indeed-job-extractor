@@ -1,6 +1,6 @@
 # Indeed Job Extractor
 
-**Version 0.4.0 — beta.** The JavaScript passes automated simulated-DOM tests, but pagination and duplicate-card handling require confirmation on the live Indeed interface.
+**Version 0.4.1 — beta.** The JavaScript passes automated simulated-DOM tests, but pagination and duplicate-card handling require confirmation on the live Indeed interface.
 
 A lightweight [Tampermonkey](https://www.tampermonkey.net/) userscript for collecting job listings and their visible full descriptions from Indeed. It runs locally in your browser and exports structured JSON, readable TXT, and a diagnostic JSON log. No API key, server, third-party analytics, or build process is required.
 
@@ -10,7 +10,7 @@ Independent, unofficial project. Not affiliated with, endorsed by, or sponsored 
 
 - **Bounded job target:** choose 10, 25, 50, 100, 250, or 500 **new successfully saved listings**. An unresolvable card does not use up the saved-job quota; the script also caps the number of attempts to prevent endless runs.
 - **Two discovery modes:** detects and follows the existing **numbered pagination controls** on `/jobs` searches; uses **bounded infinite-scroll discovery** on homepage feeds without pagination. It does not guess or fabricate page URLs.
-- **Full-page pagination resume:** checkpoints the extraction before clicking a Next Page link and resumes on the next `/jobs` page after a full browser navigation, provided the search matches. Also supports in-page pagination updates.
+- **Full-page pagination resume:** checkpoints the extraction before clicking a Next Page link and resumes on the next `/jobs` page after a full browser navigation, provided either the stable search terms or the expected next-page destination matches. Also supports in-page pagination updates.
 - **Validated sequential extraction:** activates job cards one by one without following their native links, waits for the detail pane, matches `data-jk` to the selected `vjk` URL parameter and checks the title and stability of the description.
 - **Duplicate/alias handling:** keeps previously saved entries by Job ID. If another unresponsive card matches an already saved selected listing by title, company and location (or exact card content), logs an **unverified duplicate alias** separately rather than saving stale description text under a second ID. Truly unverified cards remain visible as errors in the debug export.
 - **Robust controls:** STOP, consecutive-failure cutoff, 45-minute run timeout, maximum 60 visited result pages, and up to five unsuccessful infinite-scroll discovery attempts.
@@ -22,7 +22,7 @@ Independent, unofficial project. Not affiliated with, endorsed by, or sponsored 
 1. Install [Tampermonkey](https://www.tampermonkey.net/) in your browser.
 2. [Open the userscript](https://raw.githubusercontent.com/raffaelececere/indeed-job-extractor/main/indeed-job-extractor.user.js) and install it with Tampermonkey, or replace your existing Indeed Job Extractor script with the file from this repository.
 3. Open Indeed and navigate to its Homepage or a job search page with listings. Refresh the tab if necessary.
-4. Confirm the floating panel shows **v0.4.0**. **Do not install two copies** of the script.
+4. Confirm the floating panel shows **v0.4.1**. **Do not install two copies** of the script.
 
 Tampermonkey update metadata points to the `main` branch of this repository. Earlier saved jobs from v0.1–v0.3 use the same local storage namespace and remain available after upgrading. **Do not click CLEAR SAVED unless you intend to delete your stored jobs and debug history.**
 
@@ -55,6 +55,14 @@ The script reads the **visible Indeed interface**; it does not issue background 
 If a card cannot be selected, it is *not* automatically treated as a valid job: if it appears to be an alternative ID for the currently selected saved job, it is logged as an `duplicate_alias_skipped`; otherwise it remains a `job_skipped` error. This conservative behavior prevents an incorrect job/description association but cannot guarantee recovery of every displayed card.
 
 The userscript targets `indeed.com` and its subdomains. It was developed using the Italian desktop site in October 2026. **Other countries, accounts, layouts and mobile interfaces have not been validated.** Selectors and navigation controls may change without notice. Review exported data and follow Indeed's applicable terms and policies.
+
+## v0.4.1 — pagination compatibility fix
+
+An October 2026 live test of v0.4.0 extracted 15 of 16 visible jobs, with zero extraction errors, but stopped with `pagination_search_changed` before opening the next page. The previous guard compared incidental URL parameters as if they were part of the user's search.
+
+The v0.4.1 guard accepts additional/missing tracking and UI parameters on a genuine next-page control, while rejecting explicit changes to search keywords, location and other stable criteria. The full-navigation checkpoint can resume at its exact expected destination even if pagination omits search fields in the new URL. A mismatch now records a diagnostic warning before stopping safely.
+
+Three regression tests cover these URL variants. **Live pagination still needs verification**, especially across regional Indeed layouts and search filters.
 
 ## Development
 

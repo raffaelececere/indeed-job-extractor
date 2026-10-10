@@ -737,18 +737,45 @@
   ui('drag').addEventListener('pointercancel', () => { drag = null; });
 
   if (interruptedRun) {
-    log('warn', 'previous_run_interrupted', interruptedRun);
-    write('activeRun', null);
-    status = 'Previous run interrupted. Saved listings were kept.';
+    const canResume = interruptedRun.navigationPending
+      && /^\/jobs\/?$/.test(location.pathname)
+      && interruptedRun.searchKey === searchKey()
+      && interruptedRun.fromPageKey !== pageKey()
+      && Date.now() - interruptedRun.startedAtMs < CONFIG.maxRunMs;
+    if (canResume) {
+      resumeAfterNavigation = true;
+      status = 'Resuming extraction after pagination…';
+    } else {
+      log('warn', 'previous_run_interrupted', {
+        examined: interruptedRun.examined, navigationPending: !!interruptedRun.navigationPending
+      });
+      write('activeRun', null);
+      status = 'Previous run interrupted. Saved listings were kept.';
+    }
   }
   window.addEventListener('pagehide', () => {
     if (running) {
-      log('error', 'unexpected_page_navigation', {
-        path: location.pathname, examined, saved: jobs.size,
-        target, lastKnownJobId: currentId()
-      });
+      const checkpoint = read('activeRun', null);
+      if (!checkpoint?.navigationPending) {
+        log('error', 'unexpected_page_navigation', {
+          path: location.pathname, examined, saved: jobs.size,
+          target, lastKnownJobId: currentId()
+        });
+      }
     }
   });
   log('info', 'initialized', { version: VERSION, path: location.pathname, saved: jobs.size });
   updateUI();
+  if (resumeAfterNavigation) {
+    const resumeTimer = async () => {
+      for (let i = 0; i < 24; i++) {
+        if (cardsNow().size) { await extract(true); return; }
+        await sleep(350);
+      }
+      status = 'Could not resume: no job cards loaded. Saved jobs were preserved.';
+      write('activeRun', null);
+      updateUI();
+    };
+    void resumeTimer();
+  }
 })();

@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Indeed Job Extractor
 // @namespace    https://github.com/raffaelececere
-// @version      0.2.0
+// @version      0.3.0
 // @description  Collect Indeed job listings with bounded infinite-scroll discovery, verified descriptions, local storage and JSON/TXT exports.
 // @author       Raffaele Marco Cecere
 // @homepageURL  https://github.com/raffaelececere/indeed-job-extractor
@@ -21,13 +21,14 @@
 
   if (window.top !== window.self || document.getElementById('ije-root')) return;
 
-  const VERSION = '0.2.0';
+  const VERSION = '0.3.0';
   // Preserve v0.1 saved results and diagnostics after an upgrade.
   const PREFIX = 'IJE_V01_';
   const LIMITS = [10, 25, 50, 100, 250, 500];
   const CONFIG = Object.freeze({
     maxLogs: 1200,
     paneTimeoutMs: 10000,
+    fallbackActivationMs: 4000,
     panePollMs: 120,
     paneStableMs: 450,
     scrollPauseMs: 1400,
@@ -84,7 +85,8 @@
   let errors = 0;
   let target = 25;
   let idleScrolls = 0;
-  let lastRun = null;
+  let lastRun = read('lastRun', null);
+  const interruptedRun = read('activeRun', null);
 
   function log(level, event, fields = {}) {
     const entry = { at: new Date().toISOString(), level, event, ...fields };
@@ -141,13 +143,14 @@
     }
     return null;
   }
-  async function waitForPane(card, previous) {
-    const deadline = Date.now() + CONFIG.paneTimeoutMs;
+  async function waitForPane(card, previous, timeoutMs = CONFIG.paneTimeoutMs, initialPath = location.pathname) {
+    const deadline = Date.now() + timeoutMs;
     let signature = null;
     let stableSince = 0;
     let reason = 'timeout';
     while (Date.now() < deadline) {
       if (stopRequested) return { ok: false, reason: 'stopped' };
+      if (location.pathname !== initialPath) return { ok: false, reason: 'route_changed' };
       const jobId = currentId();
       const snap = paneSnapshot();
       if (jobId !== card.id) reason = `URL ID mismatch (${jobId || 'none'})`;
@@ -166,6 +169,33 @@
     }
     return { ok: false, reason };
   }
+  // Never invoke an unguarded native link click: on Indeed it can navigate
+  // the top-level tab to /viewjob rather than switch the existing right pane.
+  // We prevent the browser's link default at capture time while retaining the
+  // site's ordinary click handlers. If the UI does not update, we stop/skip.
+  function activateAnchorWithoutNavigation(anchor, cardId) {
+    const cancelNativeNavigation = event => {
+      if (event.cancelable) event.preventDefault();
+    };
+    anchor.addEventListener('click', cancelNativeNavigation, { capture: true });
+    try {
+      anchor.click();
+      log('info', 'safe_anchor_activated', { id: cardId });
+    } finally {
+      anchor.removeEventListener('click', cancelNativeNavigation, true);
+    }
+  }
+
+  // A non-link result-card wrapper is a conservative fallback on layouts where
+  // React intentionally ignores a default-prevented anchor click.
+  function activateCardWrapper(anchor, cardId) {
+    const cardRoot = anchor.closest('.job_seen_beacon, [data-testid="slider_item"]');
+    if (!cardRoot || cardRoot.tagName === 'A') return false;
+    cardRoot.click();
+    log('info', 'safe_card_activated', { id: cardId });
+    return true;
+  }
+
   function saveJobs() {
     const ok = write('jobs', [...jobs.values()]);
     if (!ok) log('error', 'storage_failure', { saved: jobs.size });
@@ -290,7 +320,9 @@
     let previous = null;
     let consecutiveErrors = 0;
     let endReason = 'completed';
-    log('info', 'run_started', { path: location.pathname, target, alreadySaved: jobs.size });
+    const initialPath = location.pathname;
+    write('activeRun', { startedAt: new Date().toISOString(), path: initialPath, target });
+    log('info', 'run_started', { path: initialPath, target, alreadySaved: jobs.size });
 
     function discover() {
       let added = 0;
@@ -309,6 +341,11 @@
       discover();
       updateUI();
       while (!stopRequested && examined < target) {
+        if (location.pathname !== initialPath) {
+          endReason = 'route_changed';
+          log('error', 'route_changed', { initialPath, newPath: location.pathname });
+          break;
+        }
         if (Date.now() - started > CONFIG.maxRunMs) {
           endReason = 'run_timeout';
           log('warn', 'run_timeout', { elapsedMs: Date.now() - started });
@@ -347,8 +384,15 @@
           const prior = paneSnapshot();
           const priorId = currentId();
           try {
-            anchor.click();
-            const result = await waitForPane(next, prior ? { ...prior, id: priorId } : previous);
+            const baseline = prior ? { ...prior, id: priorId } : previous;
+            activateAnchorWithoutNavigation(anchor, next.id);
+            let result = await waitForPane(next, baseline, CONFIG.fallbackActivationMs, initialPath);
+            if (!result.ok && result.reason !== 'stopped' && result.reason !== 'route_changed' && !stopRequested) {
+              log('warn', 'safe_anchor_did_not_update_pane', { id: next.id, reason: result.reason });
+              if (activateCardWrapper(anchor, next.id)) {
+                result = await waitForPane(next, baseline, CONFIG.paneTimeoutMs - CONFIG.fallbackActivationMs, initialPath);
+              }
+            }
             if (result.ok) {
               const snap = result.snap;
               jobs.set(next.id, {
@@ -373,6 +417,10 @@
               log('info', 'job_saved', { id: next.id, title: next.title, descriptionLength: snap.descriptionLength });
             } else if (result.reason === 'stopped') {
               stopRequested = true;
+            } else if (result.reason === 'route_changed') {
+              endReason = 'route_changed';
+              log('error', 'route_changed', { id: next.id, from: initialPath, to: location.pathname });
+              break;
             } else {
               errors++;
               consecutiveErrors++;
@@ -409,6 +457,8 @@
           : endReason === 'user_stop'
             ? 'Stopped manually. Partial results saved.'
             : `Stopped (${endReason}). Export DEBUG LOG.`;
+      write('lastRun', lastRun);
+      write('activeRun', null);
       log('info', 'run_finished', lastRun);
       updateUI();
     }
@@ -472,6 +522,8 @@
     saveJobs(); write('logs', []);
     examined = discovered = skippedExisting = errors = idleScrolls = 0;
     lastRun = null;
+    write('lastRun', null);
+    write('activeRun', null);
     status = 'Local saved data cleared.';
     updateUI();
   });
@@ -497,6 +549,19 @@
   ui('drag').addEventListener('pointerup', () => { drag = null; });
   ui('drag').addEventListener('pointercancel', () => { drag = null; });
 
+  if (interruptedRun) {
+    log('warn', 'previous_run_interrupted', interruptedRun);
+    write('activeRun', null);
+    status = 'Previous run interrupted. Saved listings were kept.';
+  }
+  window.addEventListener('pagehide', () => {
+    if (running) {
+      log('error', 'unexpected_page_navigation', {
+        path: location.pathname, examined, saved: jobs.size,
+        target, lastKnownJobId: currentId()
+      });
+    }
+  });
   log('info', 'initialized', { version: VERSION, path: location.pathname, saved: jobs.size });
   updateUI();
 })();

@@ -1,10 +1,18 @@
 # Indeed Job Extractor
 
-**Version 0.4.6 — beta.** Pagination and sequential extraction have been tested on the Italian desktop site. The new v0.4.5 duplicate-matching correction passes simulated-DOM tests and requires a live re-test.
+**Current version: v0.4.6 (beta).** Sequential capture and numbered-page navigation have been tested on the Italian desktop site. Other Indeed locales and layouts remain unverified.
 
 A lightweight [Tampermonkey](https://www.tampermonkey.net/) userscript for collecting job listings and their visible full descriptions from Indeed. It runs locally in your browser and exports structured JSON, AI-friendly Markdown (.md), readable TXT, and a diagnostic JSON log. No API key, server, third-party analytics, or build process is required.
 
 Independent, unofficial project. Not affiliated with, endorsed by, or sponsored by Indeed.
+
+## Screenshot
+
+<p align="center">
+  <img src="docs/images/indeed-job-extractor-panel-v0.4.6.png" alt="Indeed Job Extractor v0.4.6 floating control panel showing extraction progress, JSON, TXT, Markdown and debug export controls" width="323">
+</p>
+
+<p align="center"><em>Actual desktop control panel (v0.4.6). Counts are from one test session.</em></p>
 
 ## Features
 
@@ -17,12 +25,28 @@ Independent, unofficial project. Not affiliated with, endorsed by, or sponsored 
 - **Persistent results:** exported jobs survive page changes, refreshes, and userscript upgrades. STOP preserves partial results.
 - **Exports:** JSON, AI-friendly Markdown (all verified listings or a selected batch of 25), TXT, and DEBUG LOG. Draggable/minimizable floating panel.
 
+## Control panel
+
+| Control | Behavior |
+| --- | --- |
+| **New jobs to save** | Select the maximum number of new, verified jobs for the current run (10–500). |
+| **START EXTRACTION** | Begin sequential capture; find additional cards through supported scrolling or numbered pagination. |
+| **STOP** | Stop the current run while retaining the verified jobs already stored. |
+| **EXPORT JSON** | Download the full structured dataset for programming and reproducible analysis. |
+| **EXPORT TXT** | Download a human-readable plain-text archive. |
+| **EXPORT MD (AI)** | Download Markdown organized for reviewing listings with AI tools; uses the **Markdown range** selector. |
+| **DEBUG LOG** | Download the diagnostic report, including unverified-card records. |
+| **CLEAR SAVED** | Permanently remove local saved results; use only when you intend to reset the archive. |
+| **Markdown range** | Export all verified saved jobs or a selected batch of 25. |
+
+The panel stays entirely in the browser. The example screenshot displays 40 saved jobs, three visited results pages, and three *possible* duplicates; these figures are not fixed limits or advertised success rates.
+
 ## Install and update
 
 1. Install [Tampermonkey](https://www.tampermonkey.net/) in your browser.
 2. [Open the userscript](https://raw.githubusercontent.com/raffaelececere/indeed-job-extractor/main/indeed-job-extractor.user.js) and install it with Tampermonkey, or replace your existing Indeed Job Extractor script with the file from this repository.
 3. Open Indeed and navigate to its Homepage or a job search page with listings. Refresh the tab if necessary.
-4. Confirm the floating panel shows **v0.4.5**. **Do not install two copies** of the script.
+4. Confirm the floating panel shows **v0.4.6**. **Do not install two copies** of the script.
 
 Tampermonkey update metadata points to the `main` branch of this repository. Earlier saved jobs from v0.1–v0.3 use the same local storage namespace and remain available after upgrading. **Do not click CLEAR SAVED unless you intend to delete your stored jobs and debug history.**
 
@@ -56,11 +80,11 @@ If a card cannot be selected, it is *not* automatically treated as a valid job: 
 
 The userscript targets `indeed.com` and its subdomains. It was developed using the Italian desktop site in October 2026. **Other countries, accounts, layouts and mobile interfaces have not been validated.** Selectors and navigation controls may change without notice. Review exported data and follow Indeed's applicable terms and policies.
 
-## Version 0.4.5: pagination guard correction
+## v0.4.1 — Pagination guard correction
 
 A real `/jobs` debug run of v0.4.0 saved 15 listings, then ended with `pagination_search_changed` before clicking the next-page control. The guard compared *all* non-page URL parameters. Indeed may add/remove tracking or UI parameters between result pages, which incorrectly triggered the stop.
 
-v0.4.5 now rejects explicit changes in the actual search criteria while tolerating added or removed URL parameters on a verified pagination control. When a genuine search-criteria mismatch is detected, the DEBUG LOG records the changed parameter names and source/destination page keys. Checkpoint resume also accepts the exact expected next-page URL after a full reload. It still does not invent page URLs or follow unrelated domains. This correction is tested in the local simulated DOM but needs a new live Indeed validation.
+v0.4.1 rejects explicit changes in the actual search criteria while tolerating added or removed URL parameters on a verified pagination control. When a genuine search-criteria mismatch is detected, the DEBUG LOG records the changed parameter names and source/destination page keys. Checkpoint resume also accepts the exact expected next-page URL after a full reload. It still does not invent page URLs or follow unrelated domains. This correction is tested in the local simulated DOM but needs a new live Indeed validation.
 
 ## Development
 
@@ -77,6 +101,8 @@ Tests use an in-process simulated DOM (not a live Indeed session). The suite cov
 indeed-job-extractor/
 ├── indeed-job-extractor.user.js
 ├── README.md
+├── docs/images/
+│   └── indeed-job-extractor-panel-v0.4.6.png
 └── tests/
     └── smoke.test.js
 ```
@@ -86,19 +112,19 @@ indeed-job-extractor/
 Raffaele Marco Cecere — [GitHub @raffaelececere](https://github.com/raffaelececere)
 
 
-### v0.4.5 — preloaded pane validation
+## v0.4.2 — Preloaded pane validation
 
 Some paginated results pre-render the first job's description before the URL receives its `vjk` parameter. Earlier versions treated that *unchanged* description as stale and skipped the first result. The validator now accepts a stable title-matching description after its URL ID matches the target **only when no previously verified different job ID existed**. Stale descriptions from a known different job are still rejected.
 
 If the search genuinely has fewer eligible results than the selected target, extraction stops at the end of the available pages; the target is a maximum, not a guarantee. Unresponsive cards with unverified IDs remain excluded from exports.
 
 
-## v0.4.5 — Pagination diagnostics
+## v0.4.3 — Pagination diagnostics
 
 When the extractor exhausts the current search without detecting another page, it now records a read-only `pagination_inspection` event and includes `paginationInspection` in the DEBUG JSON export. The snapshot contains the current search query/location, the presence of a pagination container and next-page control, and brief metadata for numbered page links and controls. It helps distinguish a genuine final page from an unsupported site layout without clicking uncertain links. The extraction/navigation behavior itself is unchanged from v0.4.2.
 
 
-## v0.4.5 — Full-archive matching and unverified-card audit
+## v0.4.4 — Full-archive matching and unverified-card audit
 
 A real 35-job run identified two unopenable card IDs (for titles already present in saved jobs), but the previous matcher checked only the job currently visible in the right pane. If another job was selected, the result was wrongly reported as an unrelated extraction error. v0.4.5 now checks the entire verified saved-job collection for a **unique** title/company/location or exact-card match. Multiple matches stay ambiguous; mere title similarity never suffices.
 

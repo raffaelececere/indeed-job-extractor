@@ -1,6 +1,6 @@
 # Indeed Job Extractor
 
-**Version 0.4.2 — beta.** The JavaScript passes automated simulated-DOM tests, but pagination and duplicate-card handling require confirmation on the live Indeed interface.
+**Version 0.4.3 — beta.** The JavaScript passes automated simulated-DOM tests, but pagination and duplicate-card handling require confirmation on the live Indeed interface.
 
 A lightweight [Tampermonkey](https://www.tampermonkey.net/) userscript for collecting job listings and their visible full descriptions from Indeed. It runs locally in your browser and exports structured JSON, readable TXT, and a diagnostic JSON log. No API key, server, third-party analytics, or build process is required.
 
@@ -87,8 +87,13 @@ indeed-job-extractor/
 
 Raffaele Marco Cecere — [GitHub @raffaelececere](https://github.com/raffaelececere)
 
-## Fix in v0.4.2 — preloaded results pane
+## Fix in v0.4.3 — preloaded results pane
 
 Some paginated searches already render their first job description before the URL receives its `vjk` parameter. Earlier versions could reject that correct pre-rendered description as unchanged. Now, when no previously **verified** job ID exists, the extractor accepts a stable description after verifying the selected URL Job ID and the title. Stale content from a different, previously verified Job ID is still rejected.
 
 If fewer jobs are available than the requested target, extraction stops at the end of the available pages: the selection is a **maximum**, not a guarantee. Unreachable IDs are skipped rather than paired with unverified descriptions.
+
+
+## v0.4.3 — Pagination diagnostics
+
+When the extractor exhausts the current search without detecting another page, it now records a read-only `pagination_inspection` event and includes `paginationInspection` in the DEBUG JSON export. The snapshot contains the current search query/location, the presence of a pagination container and next-page control, and brief metadata for numbered page links and controls. It helps distinguish a genuine final page from an unsupported site layout without clicking uncertain links. The extraction/navigation behavior itself is unchanged from v0.4.2.

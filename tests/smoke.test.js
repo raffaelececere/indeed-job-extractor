@@ -10,16 +10,23 @@ const test = require('node:test');
 
 const source = fs.readFileSync(path.join(__dirname, '..', 'indeed-job-extractor.user.js'), 'utf8');
 
-function harness({ initial = 2, limit = 10, batches = [2, 2], preSaved = [], activateViaWrapper = false } = {}) {
-  const storage = new Map();
+function harness({ initial = 2, limit = 10, batches = [2, 2], preSaved = [], activateViaWrapper = false, pages = null, aliasAt = -1, startPage = 0, initialStorage = null, paginationClickNoOp = false } = {}) {
+  const storage = new Map(initialStorage || []);
   if (preSaved.length) storage.set('IJE_V01_jobs', JSON.stringify(preSaved));
   storage.set('IJE_V01_limit', JSON.stringify(limit));
-  const all = Array.from({ length: initial + batches.reduce((a, b) => a + b, 0) }, (_, i) => ({
+  const all = Array.from({ length: pages ? pages.reduce((a, b) => a + b, 0) : initial + batches.reduce((a, b) => a + b, 0) }, (_, i) => ({
     id: `abcd${String(i + 1).padStart(8, '0')}`,
     title: `Job Title ${i + 1}`,
     description: `Job description ${i + 1} and relevant technical experience. `.repeat(3)
   }));
-  let visible = initial;
+  if (aliasAt >= 1 && all[aliasAt]) {
+    all[aliasAt].id = 'abcdef0123456789';
+    all[aliasAt].title = all[aliasAt - 1].title;
+    all[aliasAt].description = all[aliasAt - 1].description;
+  }
+  let visible = pages ? pages[startPage] : initial;
+  let activePage = startPage;
+  let paginationClicks = 0;
   let batchIndex = 0;
   let selected = null;
   let scrollCalls = 0;
@@ -48,7 +55,7 @@ function harness({ initial = 2, limit = 10, batches = [2, 2], preSaved = [], act
   const anchors = all.map((job, i) => {
     const card = {
       tagName: 'DIV',
-      click: () => { selected = job; wrapperActivations++; },
+      click: () => { if (i !== aliasAt) selected = job; wrapperActivations++; },
       innerText: `${job.title} Example Corp Rome`,
       querySelector: selector => selector.includes('company') || selector.includes('companyName')
         ? { innerText: 'Example Corp' }
@@ -71,7 +78,7 @@ function harness({ initial = 2, limit = 10, batches = [2, 2], preSaved = [], act
         };
         for (const handler of clickHandlers) handler(event);
         if (!event.defaultPrevented) nativeNavigations++;
-        if (!activateViaWrapper) selected = job;
+        if (!activateViaWrapper && i !== aliasAt) selected = job;
       },
       href: `https://it.indeed.com/viewjob?jk=${job.id}`,
       index: i
@@ -90,6 +97,36 @@ function harness({ initial = 2, limit = 10, batches = [2, 2], preSaved = [], act
     scrollHeight: 6000,
     clientHeight: 1000
   };
+  const pageControls = () => {
+    if (!pages) return [];
+    const current = {
+      tagName: 'BUTTON', disabled: false,
+      getAttribute: key => key === 'aria-current' ? 'page' : null,
+      innerText: String(activePage + 1), textContent: String(activePage + 1),
+      closest: () => null
+    };
+    const next = {
+      tagName: 'A', disabled: activePage >= pages.length - 1,
+      href: 'https://it.indeed.com/jobs?q=software&l=Roma&start=' + ((activePage + 1) * 10),
+      getAttribute: key => key === 'aria-label' ? 'Next page'
+        : key === 'aria-disabled' && activePage >= pages.length - 1 ? 'true' : null,
+      innerText: '›', textContent: '›',
+      closest: () => null,
+      click: () => {
+        if (!paginationClickNoOp && activePage < pages.length - 1) {
+          activePage++;
+          paginationClicks++;
+          selected = null;
+        }
+      }
+    };
+    return [current, next];
+  };
+  const nav = {
+    querySelector: () => pageControls()[0],
+    querySelectorAll: () => pageControls(),
+    closest: () => null
+  };
   const document = {
     documentElement: scroller,
     scrollingElement: scroller,
@@ -98,12 +135,21 @@ function harness({ initial = 2, limit = 10, batches = [2, 2], preSaved = [], act
     createElement: tag => tag === 'div'
       ? { id: '', style: {}, attachShadow: () => shadow }
       : { style: {}, click: () => {}, remove: () => {} },
-    querySelectorAll: () => anchors.slice(0, visible),
+    querySelectorAll: selector => {
+      if (selector.includes('nav') || selector.includes('pagination')) return pages ? [nav] : [];
+      if (!pages) return anchors.slice(0, visible);
+      const from = pages.slice(0, activePage).reduce((a, b) => a + b, 0);
+      return anchors.slice(from, from + pages[activePage]);
+    },
     querySelector: selector => selector.includes('ViewjobPaneWrapper') ? pane : null
   };
   const location = {
-    hostname: 'it.indeed.com', pathname: '/',
-    get href() { return `https://it.indeed.com/${selected ? `?vjk=${selected.id}` : ''}`; }
+    hostname: 'it.indeed.com', origin: 'https://it.indeed.com',
+    pathname: pages ? '/jobs' : '/',
+    get href() {
+      if (pages) return 'https://it.indeed.com/jobs?q=software&l=Roma&start=' + activePage * 10 + (selected ? '&vjk=' + selected.id : '');
+      return 'https://it.indeed.com/' + (selected ? '?vjk=' + selected.id : '');
+    }
   };
   const window = {
     get top() { return window; }, get self() { return window; },
@@ -118,7 +164,7 @@ function harness({ initial = 2, limit = 10, batches = [2, 2], preSaved = [], act
   const context = {
     window, document, location, Date: TestDate,
     innerWidth: 1400, innerHeight: 900,
-    Event: class Event {}, URL, Blob,
+    Event: class Event {}, URL, URLSearchParams, Blob,
     GM_getValue: (key, fallback) => storage.get(key) ?? fallback,
     GM_setValue: (key, value) => storage.set(key, value),
     getComputedStyle: () => ({ overflowY: 'visible' }),
@@ -143,7 +189,8 @@ function harness({ initial = 2, limit = 10, batches = [2, 2], preSaved = [], act
       logs: JSON.parse(storage.get('IJE_V01_logs') || '[]'),
       scrollCalls,
       nativeNavigations,
-      wrapperActivations
+      wrapperActivations,
+      paginationClicks
     })
   };
 }

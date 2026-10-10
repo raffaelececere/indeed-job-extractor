@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Indeed Job Extractor
 // @namespace    https://github.com/raffaelececere
-// @version      0.4.2
+// @version      0.4.3
 // @description  Collect Indeed job listings with bounded infinite-scroll discovery, verified descriptions, local storage and JSON/TXT exports.
 // @author       Raffaele Marco Cecere
 // @homepageURL  https://github.com/raffaelececere/indeed-job-extractor
@@ -21,7 +21,7 @@
 
   if (window.top !== window.self || document.getElementById('ije-root')) return;
 
-  const VERSION = '0.4.2';
+  const VERSION = '0.4.3';
   // Preserve v0.1 saved results and diagnostics after an upgrade.
   const PREFIX = 'IJE_V01_';
   const LIMITS = [10, 25, 50, 100, 250, 500];
@@ -328,6 +328,56 @@
     }
     return null;
   }
+  // Diagnostic-only inspection. Never clicks or navigates. This distinguishes
+  // an exhausted one-page result from pagination controls our detector missed.
+  // Only known non-sensitive search keys and page indices are included.
+  function paginationInspection() {
+    const search = new URL(location.href);
+    const root = paginationRoot();
+    const next = nextPageControl();
+    const searchFields = Object.fromEntries(['q', 'l', 'start', 'radius'].map(key =>
+      [key, search.searchParams.get(key)]));
+    const selector = 'a,button,[role="button"]';
+    const rootControls = root ? [...root.querySelectorAll(selector)].slice(0, 16) : [];
+    const describe = el => {
+      const href = el.href || el.getAttribute?.('href') || null;
+      let target = null;
+      if (href) {
+        try {
+          const u = new URL(href, location.href);
+          if (u.origin === search.origin && /^\/jobs\/?$/.test(u.pathname)) {
+            target = { start: u.searchParams.get('start'), page: u.searchParams.get('page'),
+              searchChanged: changedExplicitSearchFields(href) };
+          }
+        } catch { /* invalid candidate URLs are excluded */ }
+      }
+      return {
+        tag: el.tagName || null,
+        label: clean(el.getAttribute?.('aria-label') || el.innerText || el.textContent).slice(0, 70),
+        testId: el.getAttribute?.('data-testid') || null,
+        current: el.getAttribute?.('aria-current') || null,
+        disabled: !!el.disabled || el.getAttribute?.('aria-disabled') === 'true',
+        target
+      };
+    };
+    const rawLinks = [...document.querySelectorAll('a[href*="start="], a[href*="page="]')];
+    const pageLinks = rawLinks.filter(el => {
+      if (el.closest?.('#ije-root')) return false;
+      try {
+        const u = new URL(el.href, location.href);
+        return u.origin === search.origin && /^\/jobs\/?$/.test(u.pathname);
+      } catch { return false; }
+    }).slice(0, 16);
+    return {
+      sourcePath: search.pathname,
+      searchFields,
+      paginationRootFound: !!root,
+      nextPageControlFound: !!next,
+      rootControls: rootControls.map(describe),
+      candidatePageLinks: pageLinks.map(describe)
+    };
+  }
+
   function canonicalCardFingerprint(card) {
     return [card.title, card.company, card.location, card.cardText]
       .map(value => clean(value).toLocaleLowerCase()).join('\n');
@@ -562,6 +612,7 @@
           }
           if (idleScrolls >= CONFIG.maxIdleScrolls) {
             endReason = 'no_more_jobs';
+            log('info', 'pagination_inspection', paginationInspection());
             break;
           }
           status = `Finding more jobs… (${idleScrolls + 1}/${CONFIG.maxIdleScrolls})`;
@@ -719,7 +770,8 @@
     download(JSON.stringify({
       generator: 'Indeed Job Extractor', version: VERSION,
       exportedAt: new Date().toISOString(), pagePath: location.pathname,
-      visibleCards: cardsNow().size, savedTotal: jobs.size, lastRun, logs
+      visibleCards: cardsNow().size, savedTotal: jobs.size, lastRun,
+      paginationInspection: paginationInspection(), logs
     }, null, 2), fileName('debug', 'json'), 'application/json;charset=utf-8');
   }
 

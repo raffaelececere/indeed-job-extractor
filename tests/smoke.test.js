@@ -10,7 +10,7 @@ const test = require('node:test');
 
 const source = fs.readFileSync(path.join(__dirname, '..', 'indeed-job-extractor.user.js'), 'utf8');
 
-function harness({ initial = 2, limit = 10, batches = [2, 2], preSaved = [] } = {}) {
+function harness({ initial = 2, limit = 10, batches = [2, 2], preSaved = [], activateViaWrapper = false } = {}) {
   const storage = new Map();
   if (preSaved.length) storage.set('IJE_V01_jobs', JSON.stringify(preSaved));
   storage.set('IJE_V01_limit', JSON.stringify(limit));
@@ -23,6 +23,8 @@ function harness({ initial = 2, limit = 10, batches = [2, 2], preSaved = [] } = 
   let batchIndex = 0;
   let selected = null;
   let scrollCalls = 0;
+  let nativeNavigations = 0;
+  let wrapperActivations = 0;
   const controls = new Map();
   const button = id => {
     if (!controls.has(id)) {
@@ -45,11 +47,14 @@ function harness({ initial = 2, limit = 10, batches = [2, 2], preSaved = [] } = 
   };
   const anchors = all.map((job, i) => {
     const card = {
+      tagName: 'DIV',
+      click: () => { selected = job; wrapperActivations++; },
       innerText: `${job.title} Example Corp Rome`,
       querySelector: selector => selector.includes('company') || selector.includes('companyName')
         ? { innerText: 'Example Corp' }
         : { innerText: 'Rome' }
     };
+    const clickHandlers = new Set();
     return {
       innerText: job.title,
       textContent: job.title,
@@ -57,7 +62,17 @@ function harness({ initial = 2, limit = 10, batches = [2, 2], preSaved = [] } = 
       getAttribute: key => key === 'data-jk' ? job.id : null,
       closest: () => card,
       scrollIntoView: () => {},
-      click: () => { selected = job; },
+      addEventListener: (type, fn) => { if (type === 'click') clickHandlers.add(fn); },
+      removeEventListener: (type, fn) => { if (type === 'click') clickHandlers.delete(fn); },
+      click: () => {
+        const event = {
+          cancelable: true, defaultPrevented: false,
+          preventDefault() { this.defaultPrevented = true; }
+        };
+        for (const handler of clickHandlers) handler(event);
+        if (!event.defaultPrevented) nativeNavigations++;
+        if (!activateViaWrapper) selected = job;
+      },
       href: `https://it.indeed.com/viewjob?jk=${job.id}`,
       index: i
     };
@@ -92,6 +107,7 @@ function harness({ initial = 2, limit = 10, batches = [2, 2], preSaved = [] } = 
   };
   const window = {
     get top() { return window; }, get self() { return window; },
+    addEventListener: () => {},
     scrollTo: () => {
       scrollCalls++;
       if (batchIndex < batches.length) visible += batches[batchIndex++];
@@ -125,7 +141,9 @@ function harness({ initial = 2, limit = 10, batches = [2, 2], preSaved = [] } = 
     stats: () => ({
       jobs: JSON.parse(storage.get('IJE_V01_jobs') || '[]'),
       logs: JSON.parse(storage.get('IJE_V01_logs') || '[]'),
-      scrollCalls
+      scrollCalls,
+      nativeNavigations,
+      wrapperActivations
     })
   };
 }
@@ -177,4 +195,27 @@ test('STOP preserves the partial results already captured', async () => {
   const { jobs, logs } = h.stats();
   assert.ok(jobs.length >= 1 && jobs.length < 10);
   assert.equal(logs.find(entry => entry.event === 'run_finished')?.reason, 'user_stop');
+});
+
+
+test('never triggers native anchor navigation during automatic extraction', async () => {
+  const h = harness({ initial: 10, limit: 10, batches: [] });
+  h.button('start').click();
+  await h.finished();
+  const { jobs, nativeNavigations, logs } = h.stats();
+  assert.equal(jobs.length, 10);
+  assert.equal(nativeNavigations, 0, 'link default action must be cancelled');
+  assert.equal(logs.find(entry => entry.event === 'run_finished')?.reason, 'job_limit_reached');
+});
+
+test('uses non-link wrapper when safe anchor action does not switch the pane', async () => {
+  const h = harness({ initial: 10, limit: 10, batches: [], activateViaWrapper: true });
+  h.button('start').click();
+  await h.finished();
+  const { jobs, logs, nativeNavigations, wrapperActivations } = h.stats();
+  assert.equal(jobs.length, 10);
+  assert.equal(nativeNavigations, 0);
+  assert.equal(wrapperActivations, 10);
+  assert.equal(logs.filter(entry => entry.event === 'safe_anchor_did_not_update_pane').length, 10);
+  assert.equal(logs.find(entry => entry.event === 'run_finished')?.reason, 'job_limit_reached');
 });

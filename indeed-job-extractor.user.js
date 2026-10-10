@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Indeed Job Extractor
 // @namespace    https://github.com/raffaelececere
-// @version      0.4.3
+// @version      0.4.4
 // @description  Collect Indeed job listings with bounded infinite-scroll discovery, verified descriptions, local storage and JSON/TXT exports.
 // @author       Raffaele Marco Cecere
 // @homepageURL  https://github.com/raffaelececere/indeed-job-extractor
@@ -21,7 +21,7 @@
 
   if (window.top !== window.self || document.getElementById('ije-root')) return;
 
-  const VERSION = '0.4.3';
+  const VERSION = '0.4.4';
   // Preserve v0.1 saved results and diagnostics after an upgrade.
   const PREFIX = 'IJE_V01_';
   const LIMITS = [10, 25, 50, 100, 250, 500];
@@ -75,6 +75,13 @@
   const storedJobs = read('jobs', []);
   for (const job of Array.isArray(storedJobs) ? storedJobs : []) {
     if (idValid(job?.id)) jobs.set(job.id, job);
+  }
+  // A failed card is not a verified job. Keep its metadata in a separate
+  // review ledger, never in the exported job collection.
+  const unverified = new Map();
+  const savedUnverified = read('unverified', []);
+  for (const item of Array.isArray(savedUnverified) ? savedUnverified : []) {
+    if (idValid(item?.id)) unverified.set(item.id, item);
   }
   let logs = read('logs', []);
   if (!Array.isArray(logs)) logs = [];
@@ -378,19 +385,45 @@
     };
   }
 
+  const normalizedField = value => clean(value).toLocaleLowerCase();
   function canonicalCardFingerprint(card) {
     return [card.title, card.company, card.location, card.cardText]
-      .map(value => clean(value).toLocaleLowerCase()).join('\n');
+      .map(normalizedField).join('\n');
   }
-  function matchingSavedDuplicate(card, currentPaneId) {
-    const original = jobs.get(currentPaneId);
-    if (!original || currentPaneId === card.id) return null;
-    const sameTitle = clean(original.title).toLocaleLowerCase() === clean(card.title).toLocaleLowerCase();
-    const sameCompany = !!clean(original.company) && clean(original.company).toLocaleLowerCase() === clean(card.company).toLocaleLowerCase();
-    const sameLocation = !!clean(original.location) && clean(original.location).toLocaleLowerCase() === clean(card.location).toLocaleLowerCase();
-    const sameCard = canonicalCardFingerprint(original) === canonicalCardFingerprint(card);
-    // Even if an unresponsive card looks duplicated, never save it under an unverified ID.
-    return sameTitle && (sameCard || (sameCompany && sameLocation)) ? original.id : null;
+  function matchingSavedDuplicates(card) {
+    // Compare against ALL verified jobs, not merely the job currently in the
+    // pane. It can be unrelated, particularly after page transitions.
+    // Matching metadata is only evidence of a POSSIBLE duplicate; a second
+    // Job ID is never marked verified or assigned a recycled description.
+    if (!normalizedField(card.title)) return [];
+    const results = [];
+    const fingerprint = canonicalCardFingerprint(card);
+    for (const original of jobs.values()) {
+      if (original.id === card.id || normalizedField(original.title) !== normalizedField(card.title)) continue;
+      if (original.sourceDomain && original.sourceDomain !== safeHost()) continue;
+      const sameCard = !!clean(original.cardText) && !!clean(card.cardText)
+        && canonicalCardFingerprint(original) === fingerprint;
+      const sameMetadata = !!normalizedField(original.company)
+        && normalizedField(original.company) === normalizedField(card.company)
+        && !!normalizedField(original.location)
+        && normalizedField(original.location) === normalizedField(card.location);
+      if (sameCard || sameMetadata) results.push({ id: original.id, basis: sameCard ? 'card_fingerprint' : 'title_company_location' });
+    }
+    return results;
+  }
+  function markUnverified(card, reason, status, matches = []) {
+    const record = {
+      id: card.id, title: card.title, company: card.company,
+      location: card.location, reason, status,
+      possibleMatches: matches, observedVjk: currentId(),
+      sourcePath: location.pathname, observedAt: new Date().toISOString(),
+      // An Indeed job link can contain tracking parameters. Store only its
+      // same-origin path and Job ID, never unrelated query string tokens.
+      intendedJobUrl: canonicalUrl(card.id)
+    };
+    unverified.set(card.id, record);
+    write('unverified', [...unverified.values()].slice(-1000));
+    return record;
   }
 
   const root = document.createElement('div');
@@ -431,7 +464,7 @@
           <span>Examined: <strong id="examined">0</strong></span><span>Discovered: <strong id="discovered">0</strong></span>
           <span>Saved total: <strong id="saved">0</strong></span>
           <span>Existing skipped: <strong id="skipped">0</strong></span><span>Errors: <strong id="errors">0</strong></span>
-          <span>Duplicate aliases: <strong id="aliases">0</strong></span><span>Pages: <strong id="pages">1</strong></span>
+          <span>Possible duplicates: <strong id="aliases">0</strong></span><span>Pages: <strong id="pages">1</strong></span>
         </div>
         <div class="buttons">
           <button class="primary" id="start">START EXTRACTION</button><button id="stop" disabled>STOP</button>
@@ -669,6 +702,7 @@
                 validation: { urlJobIdMatches: true, titleMatches: true, stableForMs: CONFIG.paneStableMs }
               });
               saveJobs();
+              if (unverified.delete(next.id)) write('unverified', [...unverified.values()]);
               savedNew++;
               previous = { ...snap, id: next.id };
               consecutiveErrors = 0;
@@ -680,20 +714,26 @@
               log('error', 'route_changed', { id: next.id, from: initialPath, to: location.pathname });
               break;
             } else {
-              const aliasOf = matchingSavedDuplicate(next, currentId());
-              if (aliasOf) {
+              const candidates = matchingSavedDuplicates(next);
+              if (candidates.length === 1) {
                 aliases++;
                 consecutiveErrors = 0;
-                log('warn', 'duplicate_alias_skipped', {
-                  id: next.id, aliasOf, title: next.title,
-                  reason: result.reason
+                markUnverified(next, result.reason, 'possible_duplicate', candidates);
+                log('warn', 'possible_duplicate_unverified', {
+                  id: next.id, possibleDuplicateOf: candidates[0].id,
+                  matchBasis: candidates[0].basis,
+                  title: next.title, reason: result.reason,
+                  verified: false
                 });
               } else {
                 errors++;
                 consecutiveErrors++;
+                const status = candidates.length > 1 ? 'ambiguous_matches' : 'unreachable';
+                markUnverified(next, result.reason, status, candidates);
                 log('warn', 'job_skipped', {
                   id: next.id, title: next.title, reason: result.reason,
-                  currentVjk: currentId(), href: anchor.href || null
+                  currentVjk: currentId(), candidateCount: candidates.length,
+                  possibleMatches: candidates, intendedJobUrl: canonicalUrl(next.id)
                 });
               }
             }
@@ -771,7 +811,8 @@
       generator: 'Indeed Job Extractor', version: VERSION,
       exportedAt: new Date().toISOString(), pagePath: location.pathname,
       visibleCards: cardsNow().size, savedTotal: jobs.size, lastRun,
-      paginationInspection: paginationInspection(), logs
+      paginationInspection: paginationInspection(),
+      unverifiedCards: [...unverified.values()], logs
     }, null, 2), fileName('debug', 'json'), 'application/json;charset=utf-8');
   }
 
@@ -791,8 +832,8 @@
   ui('debug').addEventListener('click', exportDebug);
   ui('clear').addEventListener('click', () => {
     if (!confirm(`Delete ${jobs.size} locally saved listings and debug history?`)) return;
-    jobs.clear(); logs = [];
-    saveJobs(); write('logs', []);
+    jobs.clear(); logs = []; unverified.clear();
+    saveJobs(); write('logs', []); write('unverified', []);
     examined = discovered = skippedExisting = errors = idleScrolls = aliases = savedNew = 0;
     pagesProcessed = 1;
     lastRun = null;

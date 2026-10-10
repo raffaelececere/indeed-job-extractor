@@ -4,6 +4,10 @@
 // @version      0.2.0
 // @description  Collect Indeed job listings with bounded infinite-scroll discovery, verified descriptions, local storage and JSON/TXT exports.
 // @author       Raffaele Marco Cecere
+// @homepageURL  https://github.com/raffaelececere/indeed-job-extractor
+// @supportURL   https://github.com/raffaelececere/indeed-job-extractor/issues
+// @updateURL    https://raw.githubusercontent.com/raffaelececere/indeed-job-extractor/main/indeed-job-extractor.user.js
+// @downloadURL  https://raw.githubusercontent.com/raffaelececere/indeed-job-extractor/main/indeed-job-extractor.user.js
 // @match        https://*.indeed.com/*
 // @match        https://indeed.com/*
 // @grant        GM_getValue

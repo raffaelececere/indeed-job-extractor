@@ -10,7 +10,7 @@ const test = require('node:test');
 
 const source = fs.readFileSync(path.join(__dirname, '..', 'indeed-job-extractor.user.js'), 'utf8');
 
-function harness({ initial = 2, limit = 10, batches = [2, 2], preSaved = [], activateViaWrapper = false, pages = null, aliasAt = -1, startPage = 0, initialStorage = null, paginationClickNoOp = false, paginationHrefMode = 'normal' } = {}) {
+function harness({ initial = 2, limit = 10, batches = [2, 2], preSaved = [], activateViaWrapper = false, pages = null, aliasAt = -1, startPage = 0, initialStorage = null, paginationClickNoOp = false, paginationHrefMode = 'normal', preloadedFirstPane = false } = {}) {
   const storage = new Map(initialStorage || []);
   if (preSaved.length) storage.set('IJE_V01_jobs', JSON.stringify(preSaved));
   storage.set('IJE_V01_limit', JSON.stringify(limit));
@@ -28,7 +28,8 @@ function harness({ initial = 2, limit = 10, batches = [2, 2], preSaved = [], act
   let activePage = startPage;
   let paginationClicks = 0;
   let batchIndex = 0;
-  let selected = null;
+  let selected = preloadedFirstPane ? all[pages ? pages.slice(0, startPage).reduce((a, b) => a + b, 0) : 0] : null;
+  let urlSelected = null;
   let scrollCalls = 0;
   let nativeNavigations = 0;
   let wrapperActivations = 0;
@@ -55,7 +56,7 @@ function harness({ initial = 2, limit = 10, batches = [2, 2], preSaved = [], act
   const anchors = all.map((job, i) => {
     const card = {
       tagName: 'DIV',
-      click: () => { if (i !== aliasAt) selected = job; wrapperActivations++; },
+      click: () => { if (i !== aliasAt) { selected = job; urlSelected = job; } wrapperActivations++; },
       innerText: `${job.title} Example Corp Rome`,
       querySelector: selector => selector.includes('company') || selector.includes('companyName')
         ? { innerText: 'Example Corp' }
@@ -78,7 +79,7 @@ function harness({ initial = 2, limit = 10, batches = [2, 2], preSaved = [], act
         };
         for (const handler of clickHandlers) handler(event);
         if (!event.defaultPrevented) nativeNavigations++;
-        if (!activateViaWrapper && i !== aliasAt) selected = job;
+        if (!activateViaWrapper && i !== aliasAt) { selected = job; urlSelected = job; }
       },
       href: `https://it.indeed.com/viewjob?jk=${job.id}`,
       index: i
@@ -123,6 +124,7 @@ function harness({ initial = 2, limit = 10, batches = [2, 2], preSaved = [], act
           activePage++;
           paginationClicks++;
           selected = null;
+          urlSelected = null;
         }
       }
     };
@@ -153,8 +155,8 @@ function harness({ initial = 2, limit = 10, batches = [2, 2], preSaved = [], act
     hostname: 'it.indeed.com', origin: 'https://it.indeed.com',
     pathname: pages ? '/jobs' : '/',
     get href() {
-      if (pages) return 'https://it.indeed.com/jobs?q=software&l=Roma&start=' + activePage * 10 + (selected ? '&vjk=' + selected.id : '');
-      return 'https://it.indeed.com/' + (selected ? '?vjk=' + selected.id : '');
+      if (pages) return 'https://it.indeed.com/jobs?q=software&l=Roma&start=' + activePage * 10 + (urlSelected ? '&vjk=' + urlSelected.id : '');
+      return 'https://it.indeed.com/' + (urlSelected ? '?vjk=' + urlSelected.id : '');
     }
   };
   const window = {
@@ -377,4 +379,16 @@ test('pagination rejects a link explicitly changing search keywords', async () =
   assert.equal(paginationClicks, 0);
   assert.equal(logs.find(entry => entry.event === 'run_finished')?.reason, 'pagination_search_changed');
   assert.ok(logs.find(entry => entry.event === 'pagination_search_mismatch')?.changedFields.includes('q'));
+});
+
+
+test('preloaded first-job pane with no initial vjk is captured after validated selection', async () => {
+  const h = harness({ pages: [6, 6], limit: 10, preloadedFirstPane: true });
+  h.button('start').click();
+  await h.finished();
+  const { jobs, logs } = h.stats();
+  assert.equal(jobs.length, 10);
+  assert.ok(jobs.some(job => job.id === 'abcd00000001'));
+  assert.ok(!logs.some(entry => entry.event === 'job_skipped' && entry.id === 'abcd00000001'));
+  assert.equal(logs.find(entry => entry.event === 'run_finished')?.reason, 'job_limit_reached');
 });

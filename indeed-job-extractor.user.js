@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Indeed Job Extractor
 // @namespace    https://github.com/raffaelececere
-// @version      0.4.4
+// @version      0.4.5
 // @description  Collect Indeed job listings with bounded infinite-scroll discovery, verified descriptions, local storage and JSON/TXT exports.
 // @author       Raffaele Marco Cecere
 // @homepageURL  https://github.com/raffaelececere/indeed-job-extractor
@@ -21,7 +21,7 @@
 
   if (window.top !== window.self || document.getElementById('ije-root')) return;
 
-  const VERSION = '0.4.4';
+  const VERSION = '0.4.5';
   // Preserve v0.1 saved results and diagnostics after an upgrade.
   const PREFIX = 'IJE_V01_';
   const LIMITS = [10, 25, 50, 100, 250, 500];
@@ -683,6 +683,47 @@
                 result = await waitForPane(next, baseline, CONFIG.paneTimeoutMs - CONFIG.fallbackActivationMs, initialPath);
               }
             }
+            // A search page may preselect its first listing in the detail pane
+            // without setting vjk. Clicking the already-selected card can be
+            // ignored. Make one bounded alternate-card switch and retry, but
+            // only save if URL ID, title and stable description ALL validate.
+            if (!result.ok && !stopRequested && !priorId && !previous
+              && /^\/jobs\/?$/.test(initialPath)
+              && result.reason.startsWith('URL ID mismatch')) {
+              const alternate = [...cardsNow().values()].find(card => card.id !== next.id);
+              const alternateAnchor = alternate && findAnchor(alternate.id);
+              if (alternateAnchor) {
+                log('info', 'first_card_recovery_started', { id: next.id, alternateId: alternate.id });
+                try {
+                  activateAnchorWithoutNavigation(alternateAnchor, alternate.id);
+                  let alternateResult = await waitForPane(alternate, baseline, 2200, initialPath);
+                  if (!alternateResult.ok && !stopRequested
+                    && alternateResult.reason !== 'route_changed'
+                    && activateCardWrapper(alternateAnchor, alternate.id)) {
+                    alternateResult = await waitForPane(alternate, baseline, 2200, initialPath);
+                  }
+                  if (alternateResult.ok && !stopRequested) {
+                    const targetAnchor = findAnchor(next.id);
+                    if (targetAnchor) {
+                      activateAnchorWithoutNavigation(targetAnchor, next.id);
+                      const changedBaseline = { ...alternateResult.snap, id: alternate.id };
+                      result = await waitForPane(next, changedBaseline, 2500, initialPath);
+                      if (!result.ok && result.reason !== 'route_changed'
+                        && !stopRequested && activateCardWrapper(targetAnchor, next.id)) {
+                        result = await waitForPane(next, changedBaseline, 2500, initialPath);
+                      }
+                    }
+                  }
+                  log(result.ok ? 'info' : 'warn', result.ok
+                    ? 'first_card_recovered' : 'first_card_recovery_unsuccessful',
+                    { id: next.id, alternateId: alternate.id,
+                      reason: result.ok ? null : result.reason });
+                } catch (recoveryError) {
+                  log('warn', 'first_card_recovery_exception',
+                    { id: next.id, message: String(recoveryError?.message || recoveryError) });
+                }
+              }
+            }
             if (result.ok) {
               const snap = result.snap;
               jobs.set(next.id, {
@@ -789,15 +830,26 @@
     setTimeout(() => URL.revokeObjectURL(url), 30000);
   }
   const fileName = (kind, ext) => `indeed_${kind}_${new Date().toISOString().replace(/[:.]/g, '-')}.${ext}`;
+  function exportState() {
+    return {
+      status: running ? 'in_progress' : (lastRun ? 'finished' : 'no_finished_run'),
+      partialSnapshot: running,
+      savedThisRun: savedNew, examined, target, pagesProcessed,
+      finishedAt: !running ? lastRun?.finishedAt || null : null
+    };
+  }
   function exportJSON() {
     download(JSON.stringify({
       generator: 'Indeed Job Extractor', version: VERSION,
       exportedAt: new Date().toISOString(), jobCount: jobs.size,
+      extractionState: exportState(),
       jobs: [...jobs.values()]
     }, null, 2), fileName('jobs', 'json'), 'application/json;charset=utf-8');
   }
   function exportTXT() {
-    const lines = [`Indeed Job Extractor v${VERSION}`, `Exported: ${new Date().toISOString()}`, `Jobs: ${jobs.size}`, ''];
+    const snapshot = exportState();
+    const lines = [`Indeed Job Extractor v${VERSION}`, `Exported: ${new Date().toISOString()}`, `Jobs: ${jobs.size}`,
+      `Extraction status: ${snapshot.status}${snapshot.partialSnapshot ? ' (PARTIAL SNAPSHOT - STILL RUNNING)' : ''}`, ''];
     for (const job of jobs.values()) {
       lines.push('='.repeat(76), `TITLE: ${job.title}`, `COMPANY: ${job.company || 'Not available'}`,
         `LOCATION: ${job.location || 'Not available'}`, `JOB ID: ${job.id}`, `URL: ${job.url}`,
@@ -811,6 +863,7 @@
       generator: 'Indeed Job Extractor', version: VERSION,
       exportedAt: new Date().toISOString(), pagePath: location.pathname,
       visibleCards: cardsNow().size, savedTotal: jobs.size, lastRun,
+      extractionState: exportState(),
       paginationInspection: paginationInspection(),
       unverifiedCards: [...unverified.values()], logs
     }, null, 2), fileName('debug', 'json'), 'application/json;charset=utf-8');
